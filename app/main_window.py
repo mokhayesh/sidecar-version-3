@@ -347,6 +347,9 @@ class MainWindow(wx.Frame):
         self.quality_rules = {}
         self.current_process = ""
 
+
+        self._undo_stack = []
+        self._redo_stack = []
         self.metrics = {
             "rows": None, "cols": None, "null_pct": None, "uniqueness": None,
             "dq_score": None, "validity": None, "completeness": None, "anomalies": None,
@@ -379,7 +382,17 @@ class MainWindow(wx.Frame):
         hbox.Add(title, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 12)
 
         hbox.AddStretchSpacer(1)
-        self.little_pill = LittleBuddyPill(header, handler=self.on_little_buddy)
+
+        # Connection status (best-effort indicators)
+        self._conn_labels = {}
+        for key in ("AWS", "Snowflake", "dbt", "Fabric"):
+            st = wx.StaticText(header, label=f"{key}: —")
+            st.SetForegroundColour(wx.Colour(230, 225, 255))
+            f = st.GetFont(); f.SetPointSize(8); st.SetFont(f)
+            hbox.Add(st, 0, wx.RIGHT | wx.ALIGN_CENTER_VERTICAL, 10)
+            self._conn_labels[key] = st
+
+        self.little_pill = LittleBuddyPill(header, handler=getattr(self, 'on_little_buddy', lambda e: wx.MessageBox('Little Buddy handler missing (on_little_buddy).','Little Buddy', wx.OK|wx.ICON_ERROR)))
         hbox.Add(self.little_pill, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 8)
 
         header.SetSizer(hbox)
@@ -463,6 +476,9 @@ class MainWindow(wx.Frame):
         # Group 3: Actions
         g_actions = _group("ACTIONS", 610, tint=tint_actions)
         add_btn(g_actions, "Rule Assignment", self.on_rules)
+        add_btn(g_actions, "Transform", self.on_transform_menu)
+        add_btn(g_actions, "Undo", self.on_undo)
+        add_btn(g_actions, "Redo", self.on_redo)
         add_btn(g_actions, "Knowledge Files", self.on_load_knowledge)
         add_btn(g_actions, "MDM", self.on_mdm)
         add_btn(g_actions, "Synthetic Data", self.on_generate_synth)
@@ -536,15 +552,14 @@ class MainWindow(wx.Frame):
         self.catalog_toolbar_panel.Hide()
         main.Add(self.catalog_toolbar_panel, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 4)
 
-        # Main content: grid (left) + Wizard Console (right)
-        splitter = wx.SplitterWindow(self, style=wx.SP_LIVE_UPDATE | wx.SP_3D)
-        splitter.SetMinimumPaneSize(260)
+        # Main content: Grid (top) + Wizard Console (bottom)
+        splitter = wx.SplitterWindow(self, style=wx.SP_LIVE_UPDATE)
+        splitter.SetMinimumPaneSize(140)
 
-        left_panel = wx.Panel(splitter); left_panel.SetBackgroundColour(BG)
-        right_panel = wx.Panel(splitter); right_panel.SetBackgroundColour(BG)
-
-        # Left: Grid
-        self.grid = gridlib.Grid(left_panel); self.grid.CreateGrid(0, 0)
+        # Top pane: data grid
+        top_panel = wx.Panel(splitter)
+        top_panel.SetBackgroundColour(BG)
+        self.grid = gridlib.Grid(top_panel); self.grid.CreateGrid(0, 0)
         self.grid.SetDefaultCellTextColour(wx.Colour(35, 31, 51))
         self.grid.SetDefaultCellBackgroundColour(wx.Colour(255,255,255))
         self.grid.SetLabelTextColour(wx.Colour(60,60,90))
@@ -555,35 +570,46 @@ class MainWindow(wx.Frame):
         self.grid.Bind(wx.EVT_SIZE, self.on_grid_resize)
         self.grid.Bind(gridlib.EVT_GRID_CELL_CHANGED, self.on_cell_changed)
 
-        gp = wx.BoxSizer(wx.VERTICAL)
-        gp.Add(self.grid, 1, wx.EXPAND | wx.ALL, 8)
-        left_panel.SetSizer(gp)
+        tp = wx.BoxSizer(wx.VERTICAL)
+        tp.Add(self.grid, 1, wx.EXPAND | wx.ALL, 8)
+        top_panel.SetSizer(tp)
 
-        # Right: Wizard Console
-        rp = wx.BoxSizer(wx.VERTICAL)
+        # Bottom pane: Wizard Console (logs/issues/summary + progress)
+        bottom_panel = wx.Panel(splitter)
+        bottom_panel.SetBackgroundColour(wx.Colour(252, 250, 255))
 
-        hdr = wx.BoxSizer(wx.HORIZONTAL)
-        lbl = wx.StaticText(right_panel, label="Wizard Console")
-        lf = lbl.GetFont(); lf.SetPointSize(10); lf.SetWeight(wx.FONTWEIGHT_BOLD)
-        lbl.SetFont(lf)
-        lbl.SetForegroundColour(wx.Colour(44, 31, 72))
-        hdr.Add(lbl, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 8)
+        bp = wx.BoxSizer(wx.VERTICAL)
 
-        hdr.AddStretchSpacer(1)
-        self.lbl_console_status = wx.StaticText(right_panel, label="Ready")
-        self.lbl_console_status.SetForegroundColour(wx.Colour(94, 64, 150))
-        hdr.Add(self.lbl_console_status, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 8)
+        console_hdr = wx.BoxSizer(wx.HORIZONTAL)
+        lbl_console = wx.StaticText(bottom_panel, label="Wizard Console")
+        lf = lbl_console.GetFont()
+        lf.SetPointSize(9)
+        lf.SetWeight(wx.FONTWEIGHT_BOLD)
+        lbl_console.SetFont(lf)
+        lbl_console.SetForegroundColour(wx.Colour(44, 31, 72))
+        console_hdr.Add(lbl_console, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 6)
+        console_hdr.AddStretchSpacer(1)
 
-        rp.Add(hdr, 0, wx.EXPAND)
-        rp.Add(wx.StaticLine(right_panel), 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
+        self.progress_label = wx.StaticText(bottom_panel, label="")
+        self.progress_label.SetForegroundColour(wx.Colour(94, 64, 150))
+        self.lbl_console_status = self.progress_label  # backward-compatible alias
+        console_hdr.Add(self.progress_label, 0, wx.RIGHT | wx.ALIGN_CENTER_VERTICAL, 8)
 
-        nb = wx.Notebook(right_panel)
+        self.progress_gauge = wx.Gauge(bottom_panel, range=100, size=(220, 12), style=wx.GA_HORIZONTAL)
+        self.progress_gauge.SetValue(0)
+        console_hdr.Add(self.progress_gauge, 0, wx.RIGHT | wx.ALIGN_CENTER_VERTICAL, 8)
+
+        bp.Add(console_hdr, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 4)
+        bp.Add(wx.StaticLine(bottom_panel), 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 4)
+
+        nb = wx.Notebook(bottom_panel)
 
         # Logs tab
         p_logs = wx.Panel(nb)
         v_logs = wx.BoxSizer(wx.VERTICAL)
-        self.txt_console = wx.TextCtrl(p_logs, value="", style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL)
-        v_logs.Add(self.txt_console, 1, wx.EXPAND | wx.ALL, 8)
+        self.txt_logs = wx.TextCtrl(p_logs, value="", style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL)
+        self.txt_console = self.txt_logs  # backward-compatible alias
+        v_logs.Add(self.txt_logs, 1, wx.EXPAND | wx.ALL, 8)
         p_logs.SetSizer(v_logs)
         nb.AddPage(p_logs, "Logs")
 
@@ -603,10 +629,10 @@ class MainWindow(wx.Frame):
         p_summary.SetSizer(v_sum)
         nb.AddPage(p_summary, "Summary")
 
-        rp.Add(nb, 1, wx.EXPAND | wx.ALL, 6)
-        right_panel.SetSizer(rp)
+        bp.Add(nb, 1, wx.EXPAND | wx.ALL, 6)
+        bottom_panel.SetSizer(bp)
 
-        splitter.SplitVertically(left_panel, right_panel, sashPosition=1000)
+        splitter.SplitHorizontally(top_panel, bottom_panel, sashPosition=520)
         main.Add(splitter, 1, wx.EXPAND | wx.ALL, 4)
 
         # Menubar
@@ -620,6 +646,13 @@ class MainWindow(wx.Frame):
         self.SetMenuBar(mb)
 
         self.SetSizer(main)
+
+        # Periodic connection checks (non-blocking)
+        self._conn_state = {}
+        self._conn_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self._on_conn_timer, self._conn_timer)
+        self._conn_timer.Start(5000)
+        wx.CallAfter(self.refresh_connection_status)
 
     # Knowledge helpers
     def _get_prioritized_knowledge(self):
@@ -684,19 +717,25 @@ class MainWindow(wx.Frame):
     def console_log(self, message: str):
         """Append a line to the Wizard Console log (safe to call from anywhere)."""
         try:
-            if not hasattr(self, "txt_console") or self.txt_console is None:
+            target = getattr(self, "txt_console", None) or getattr(self, "txt_logs", None)
+            if target is None:
                 return
             line = f"[{self._console_ts()}] {message}\n"
-            self.txt_console.AppendText(line)
+            target.AppendText(line)
         except Exception:
             pass
 
     def console_set_status(self, message: str):
         try:
-            if hasattr(self, "lbl_console_status") and self.lbl_console_status:
-                self.lbl_console_status.SetLabel(message)
+            target = getattr(self, "lbl_console_status", None) or getattr(self, "progress_label", None)
+            if target:
+                target.SetLabel(message)
         except Exception:
             pass
+
+    def _console_log(self, message: str):
+        """Backward-compatible wrapper for legacy calls."""
+        self.console_log(message)
     # Utils
     @staticmethod
     def _as_df(rows, cols):
@@ -886,6 +925,200 @@ class MainWindow(wx.Frame):
             wx.MessageBox(f"Could not open Quality Rule Assignment:\n{e}",
                           "Quality Rules", wx.OK | wx.ICON_ERROR)
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # Transformations (NEW)
+    # ──────────────────────────────────────────────────────────────────────────
+    
+    def _snapshot_dataset(self):
+        """Return a lightweight snapshot of the current dataset for undo/redo."""
+        return {
+            "headers": list(self.headers or []),
+            "raw_data": [list(r) for r in (self.raw_data or [])],
+            "current_process": self.current_process,
+            "metrics": dict(self.metrics or {}),
+        }
+    
+    def _restore_dataset(self, snap: dict):
+        self.headers = list(snap.get("headers") or [])
+        self.raw_data = [list(r) for r in (snap.get("raw_data") or [])]
+        self.current_process = snap.get("current_process") or ""
+        # metrics will be recalculated/reset for safety
+        self._display(self.headers, self.raw_data)
+        self._reset_kpis_for_new_dataset(self.headers, self.raw_data)
+        self._show_catalog_toolbar(self.current_process == "Catalog")
+    
+    def _push_undo(self, reason: str = ""):
+        try:
+            self._undo_stack.append(self._snapshot_dataset())
+            # keep undo bounded
+            if len(self._undo_stack) > 30:
+                self._undo_stack = self._undo_stack[-30:]
+            self._redo_stack = []
+            if reason:
+                self._console_log(f"Undo checkpoint: {reason}")
+        except Exception:
+            pass
+    
+    def on_undo(self, _evt=None):
+        if not getattr(self, "_undo_stack", None):
+            wx.MessageBox("Nothing to undo.", "Undo", wx.OK | wx.ICON_INFORMATION)
+            return
+        try:
+            cur = self._snapshot_dataset()
+            snap = self._undo_stack.pop()
+            self._redo_stack.append(cur)
+            self._restore_dataset(snap)
+            self._console_log("Undo applied.")
+        except Exception as e:
+            wx.MessageBox(f"Undo failed: {e}", "Undo", wx.OK | wx.ICON_ERROR)
+    
+    def on_redo(self, _evt=None):
+        if not getattr(self, "_redo_stack", None):
+            wx.MessageBox("Nothing to redo.", "Redo", wx.OK | wx.ICON_INFORMATION)
+            return
+        try:
+            cur = self._snapshot_dataset()
+            snap = self._redo_stack.pop()
+            self._undo_stack.append(cur)
+            self._restore_dataset(snap)
+            self._console_log("Redo applied.")
+        except Exception as e:
+            wx.MessageBox(f"Redo failed: {e}", "Redo", wx.OK | wx.ICON_ERROR)
+    
+    def on_transform_menu(self, _evt=None):
+        if (not self.headers) and self.grid.GetNumberCols() == 0:
+            wx.MessageBox("Load data first so there is something to transform.", "Transform",
+                          wx.OK | wx.ICON_WARNING)
+            return
+    
+        # Use current view columns
+        cols = list(self.headers or [])
+        if not cols and self.grid.GetNumberCols() > 0:
+            cols = [self.grid.GetColLabelValue(i) for i in range(self.grid.GetNumberCols())]
+    
+        dlg = TransformDialog(self, columns=cols)
+        if dlg.ShowModal() != wx.ID_OK:
+            dlg.Destroy()
+            return
+        spec = dlg.get_params()
+        dlg.Destroy()
+    
+        try:
+            self._push_undo(reason=f"Transform: {spec.get('operation')}")
+            self._apply_transformation(spec)
+            self._console_log(f"Transform complete: {spec.get('operation')}")
+        except Exception as e:
+            import traceback
+            wx.MessageBox(f"Transform failed:\n\n{e}\n\n{traceback.format_exc()}",
+                          "Transform", wx.OK | wx.ICON_ERROR)
+            self.kernel.log("transform_failed", error=str(e), spec=spec)
+    
+    def _apply_transformation(self, spec: dict):
+        op = (spec.get("operation") or "").strip()
+        df = pd.DataFrame(self.raw_data, columns=self.headers)
+    
+        def to_str(x):
+            return "" if x is None else str(x)
+    
+        if op == "Trim whitespace (all text)":
+            for c in df.columns:
+                if df[c].dtype == object:
+                    df[c] = df[c].map(lambda v: to_str(v).strip())
+            self.kernel.log("transform_trim", cols=len(df.columns))
+    
+        elif op == "Normalize column names (snake_case)":
+            new_cols = []
+            for c in df.columns:
+                s = str(c).strip()
+                s = re.sub(r"\s+", "_", s)
+                s = re.sub(r"[^A-Za-z0-9_]+", "_", s)
+                s = re.sub(r"_+", "_", s).strip("_")
+                new_cols.append(s or "col")
+            df.columns = new_cols
+            self.kernel.log("transform_cols_snake_case")
+    
+        elif op == "Drop duplicate rows":
+            before = len(df)
+            df = df.drop_duplicates()
+            self.kernel.log("transform_drop_duplicates", before=before, after=len(df))
+    
+        elif op == "Fill nulls in column":
+            col = spec.get("column") or ""
+            fill_val = spec.get("value")
+            if col not in df.columns:
+                raise ValueError(f"Column not found: {col}")
+            before_nulls = int(df[col].isna().sum())
+            df[col] = df[col].where(~df[col].isna(), other=fill_val)
+            self.kernel.log("transform_fill_nulls", column=col, before_nulls=before_nulls)
+    
+        elif op == "Find & replace (regex)":
+            col = spec.get("column") or ""
+            pattern = spec.get("pattern") or ""
+            repl = spec.get("replacement") or ""
+            if col not in df.columns:
+                raise ValueError(f"Column not found: {col}")
+            rx = re.compile(pattern)
+            df[col] = df[col].map(lambda v: rx.sub(repl, to_str(v)))
+            self.kernel.log("transform_regex_replace", column=col)
+    
+        elif op == "Cast column to numeric":
+            col = spec.get("column") or ""
+            if col not in df.columns:
+                raise ValueError(f"Column not found: {col}")
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+            self.kernel.log("transform_cast_numeric", column=col)
+    
+        elif op == "Parse column as date":
+            col = spec.get("column") or ""
+            fmt = (spec.get("date_format") or "").strip() or None
+            if col not in df.columns:
+                raise ValueError(f"Column not found: {col}")
+            if fmt:
+                df[col] = pd.to_datetime(df[col], errors="coerce", format=fmt).dt.date.astype(str)
+            else:
+                df[col] = pd.to_datetime(df[col], errors="coerce").dt.date.astype(str)
+            self.kernel.log("transform_parse_date", column=col, fmt=fmt or "auto")
+    
+        elif op == "Mask PII (email/phone)":
+            cols = spec.get("columns") or []
+            if not cols:
+                cols = [c for c in df.columns if any(k in c.lower() for k in ["email","phone","mobile","cell"])]
+            for col in cols:
+                if col not in df.columns:
+                    continue
+                low = col.lower()
+                if "email" in low:
+                    def mask_email(v):
+                        s = to_str(v).strip()
+                        if "@" not in s: 
+                            return s
+                        name, dom = s.split("@", 1)
+                        if len(name) <= 2:
+                            m = "*" * len(name)
+                        else:
+                            m = name[0] + ("*" * (len(name)-2)) + name[-1]
+                        return m + "@" + dom
+                    df[col] = df[col].map(mask_email)
+                else:
+                    def mask_phone(v):
+                        s = re.sub(r"\D+", "", to_str(v))
+                        if len(s) < 4:
+                            return to_str(v)
+                        return "*" * max(0, len(s)-4) + s[-4:]
+                    df[col] = df[col].map(mask_phone)
+            self.kernel.log("transform_mask_pii", columns=cols)
+    
+        else:
+            raise ValueError(f"Unsupported transformation: {op}")
+    
+        self.headers = list(df.columns)
+        # keep as list-of-lists, stringify for grid stability
+        self.raw_data = df.astype(object).where(pd.notna(df), None).values.tolist()
+        self.current_process = "Transform"
+        self._show_catalog_toolbar(False)
+        self._display(self.headers, self.raw_data)
+        self._reset_kpis_for_new_dataset(self.headers, self.raw_data)
+
     # Settings & Buddy
     def open_settings(self, _evt=None):
         try:
@@ -918,7 +1151,141 @@ class MainWindow(wx.Frame):
         except Exception as e:
             wx.MessageBox(f"Little Buddy failed to open:\n{e}", "Little Buddy", wx.OK | wx.ICON_ERROR)
 
-    # Synthetic data (unchanged)
+    
+    # ──────────────────────────────────────────────────────────────────────────
+    # Connection status + progress helpers (NEW)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _on_conn_timer(self, _evt=None):
+        # Refresh in the UI thread; actual network checks are done in worker threads.
+        self.refresh_connection_status()
+
+    def refresh_connection_status(self):
+        """Best-effort connection checks. Never hard-fail the app if a connector isn't installed."""
+        def set_label(name: str, ok: bool, msg: str):
+            lbl = getattr(self, "_conn_labels", {}).get(name)
+            if not lbl:
+                return
+            # soft green/red-ish using text (we keep header background dark)
+            dot = "●"
+            lbl.SetLabel(f"{dot} {name}: {msg}")
+            lbl.SetForegroundColour(wx.Colour(140, 255, 170) if ok else wx.Colour(255, 180, 180))
+
+        def update_state(key, ok, msg):
+            prev = self._conn_state.get(key)
+            cur = (bool(ok), str(msg))
+            self._conn_state[key] = cur
+            if prev != cur:
+                self.console_log(f"Connection {key}: {msg}" if ok else f"Connection {key}: {msg}")
+
+        # AWS (configured vs live)
+        def check_aws():
+            ok = False
+            msg = "not configured"
+            if os.environ.get("AWS_PROFILE") or (os.environ.get("AWS_ACCESS_KEY_ID") and os.environ.get("AWS_SECRET_ACCESS_KEY")):
+                msg = "configured"
+                ok = True
+            # Try a fast STS call if boto3 is available (optional)
+            try:
+                import boto3  # type: ignore
+                try:
+                    sts = boto3.client("sts", region_name=os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION"))
+                    sts.get_caller_identity()
+                    ok = True
+                    msg = "live"
+                except Exception:
+                    # keep configured
+                    pass
+            except Exception:
+                pass
+            wx.CallAfter(set_label, "AWS", ok, msg)
+            wx.CallAfter(update_state, "AWS", ok, msg)
+
+        # Snowflake
+        def check_snowflake():
+            ok = False
+            msg = "not configured"
+            if os.environ.get("SNOWFLAKE_ACCOUNT") and os.environ.get("SNOWFLAKE_USER"):
+                ok = True
+                msg = "configured"
+            try:
+                import snowflake.connector  # type: ignore
+                # Only attempt connect if password/token present to avoid prompting
+                if os.environ.get("SNOWFLAKE_PASSWORD") or os.environ.get("SNOWFLAKE_OAUTH_TOKEN"):
+                    try:
+                        kwargs = dict(
+                            account=os.environ.get("SNOWFLAKE_ACCOUNT"),
+                            user=os.environ.get("SNOWFLAKE_USER"),
+                            warehouse=os.environ.get("SNOWFLAKE_WAREHOUSE") or None,
+                            database=os.environ.get("SNOWFLAKE_DATABASE") or None,
+                            schema=os.environ.get("SNOWFLAKE_SCHEMA") or None,
+                            login_timeout=5,
+                            network_timeout=5,
+                        )
+                        if os.environ.get("SNOWFLAKE_OAUTH_TOKEN"):
+                            kwargs["authenticator"] = "oauth"
+                            kwargs["token"] = os.environ.get("SNOWFLAKE_OAUTH_TOKEN")
+                        else:
+                            kwargs["password"] = os.environ.get("SNOWFLAKE_PASSWORD")
+                        conn = snowflake.connector.connect(**{k:v for k,v in kwargs.items() if v})
+                        cur = conn.cursor()
+                        cur.execute("select 1")
+                        cur.close()
+                        conn.close()
+                        ok = True
+                        msg = "live"
+                    except Exception:
+                        # keep configured
+                        pass
+            except Exception:
+                pass
+            wx.CallAfter(set_label, "Snowflake", ok, msg)
+            wx.CallAfter(update_state, "Snowflake", ok, msg)
+
+        # dbt (installed vs configured)
+        def check_dbt():
+            ok = False
+            msg = "not installed"
+            try:
+                # Use subprocess (fast)
+                cp = subprocess.run(["dbt", "--version"], capture_output=True, text=True, timeout=5, shell=False)
+                if cp.returncode == 0:
+                    ok = True
+                    msg = "installed"
+            except Exception:
+                pass
+            wx.CallAfter(set_label, "dbt", ok, msg)
+            wx.CallAfter(update_state, "dbt", ok, msg)
+
+        # Fabric (best-effort: configured)
+        def check_fabric():
+            ok = False
+            msg = "not configured"
+            if os.environ.get("FABRIC_TENANT_ID") or os.environ.get("POWERBI_TENANT_ID") or os.environ.get("AZURE_TENANT_ID"):
+                ok = True
+                msg = "configured"
+            wx.CallAfter(set_label, "Fabric", ok, msg)
+            wx.CallAfter(update_state, "Fabric", ok, msg)
+
+        for fn in (check_aws, check_snowflake, check_dbt, check_fabric):
+            threading.Thread(target=fn, daemon=True).start()
+
+    def _set_progress(self, pct: int | None = None, msg: str = ""):
+        try:
+            if hasattr(self, "progress_label") and self.progress_label:
+                self.progress_label.SetLabel(msg or "")
+            if hasattr(self, "progress_gauge") and self.progress_gauge:
+                if pct is None:
+                    self.progress_gauge.Pulse()
+                else:
+                    self.progress_gauge.SetValue(max(0, min(100, int(pct))))
+        except Exception:
+            pass
+
+    def _clear_progress(self):
+        self._set_progress(0, "")
+
+# Synthetic data (unchanged)
     @staticmethod
     def _most_common_format(strings, default_mask="DDD-DDD-DDDD"):
         def mask_one(s): return re.sub(r"\d", "D", s)
@@ -1307,6 +1674,7 @@ class MainWindow(wx.Frame):
             wx.MessageBox("Load data first.", "No data", wx.OK | wx.ICON_WARNING); return
 
         self.current_process = proc_name
+        self._set_progress(None, f"Running: {proc_name}")
         df = self._as_df(self.raw_data, self.headers)
         self.console_set_status(f"Running: {proc_name}")
         self.console_log(f"Run analysis: {proc_name}")
@@ -1409,6 +1777,7 @@ class MainWindow(wx.Frame):
             self._show_catalog_toolbar(False)
 
         self._display(hdr, data)
+        self._clear_progress()
 
     # Robust anomaly detector
     def _detect_anomalies(self, df: pd.DataFrame):
@@ -3504,6 +3873,93 @@ class DbtLogDialog(wx.Dialog):
 
         self.SetSizer(v)
         self.Layout()
+
+
+class TransformDialog(wx.Dialog):
+    def __init__(self, parent, columns=None):
+        super().__init__(parent, title="Transform Data", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.SetMinSize((720, 520))
+        self.columns = list(columns or [])
+
+        outer = wx.BoxSizer(wx.VERTICAL)
+        panel = wx.Panel(self)
+        v = wx.BoxSizer(wx.VERTICAL)
+
+        hint = wx.StaticText(panel, label=(
+            "Apply common transformations to the currently loaded dataset.\n"
+            "Tip: Use Undo/Redo in Actions to roll changes back and forth."
+        ))
+        v.Add(hint, 0, wx.ALL, 10)
+
+        grid = wx.FlexGridSizer(0, 2, 10, 12)
+        grid.AddGrowableCol(1, 1)
+
+        def add_row(label, ctrl):
+            grid.Add(wx.StaticText(panel, label=label), 0, wx.ALIGN_CENTER_VERTICAL)
+            grid.Add(ctrl, 1, wx.EXPAND)
+
+        self.cbo_op = wx.Choice(panel, choices=[
+            "Trim whitespace (all text)",
+            "Normalize column names (snake_case)",
+            "Drop duplicate rows",
+            "Fill nulls in column",
+            "Find & replace (regex)",
+            "Cast column to numeric",
+            "Parse column as date",
+            "Mask PII (email/phone)",
+        ])
+        self.cbo_op.SetSelection(0)
+        add_row("Operation", self.cbo_op)
+
+        self.cbo_col = wx.Choice(panel, choices=self.columns)
+        if self.columns:
+            self.cbo_col.SetSelection(0)
+        add_row("Column (when needed)", self.cbo_col)
+
+        self.txt_value = wx.TextCtrl(panel, value="")
+        add_row("Value (Fill nulls)", self.txt_value)
+
+        self.txt_pattern = wx.TextCtrl(panel, value="")
+        add_row("Regex Pattern", self.txt_pattern)
+
+        self.txt_repl = wx.TextCtrl(panel, value="")
+        add_row("Replacement", self.txt_repl)
+
+        self.txt_datefmt = wx.TextCtrl(panel, value="")
+        add_row("Date Format (optional)", self.txt_datefmt)
+
+        self.lst_cols = wx.CheckListBox(panel, choices=self.columns)
+        add_row("Mask columns (optional)", self.lst_cols)
+
+        v.Add(grid, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+
+        v.Add(wx.StaticLine(panel), 0, wx.EXPAND | wx.ALL, 10)
+
+        btns = wx.StdDialogButtonSizer()
+        ok = wx.Button(panel, wx.ID_OK)
+        ca = wx.Button(panel, wx.ID_CANCEL)
+        btns.AddButton(ok); btns.AddButton(ca); btns.Realize()
+        v.Add(btns, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
+
+        panel.SetSizer(v)
+        outer.Add(panel, 1, wx.EXPAND)
+        self.SetSizer(outer)
+        self.Layout()
+
+    def get_params(self):
+        op = self.cbo_op.GetStringSelection()
+        col = self.cbo_col.GetStringSelection() if self.cbo_col.GetCount() else ""
+        checked_cols = [self.lst_cols.GetString(i) for i in range(self.lst_cols.GetCount()) if self.lst_cols.IsChecked(i)]
+        return {
+            "operation": op,
+            "column": col,
+            "value": self.txt_value.GetValue(),
+            "pattern": self.txt_pattern.GetValue(),
+            "replacement": self.txt_repl.GetValue(),
+            "date_format": self.txt_datefmt.GetValue(),
+            "columns": checked_cols,
+        }
+
 
 class ConfigFileDialog(wx.Dialog):
     def __init__(self, parent):

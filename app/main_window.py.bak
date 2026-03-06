@@ -1,7 +1,7 @@
 # app/main_window.py
 # Lavender UI + full functionality (MDM, Synthetic Data, Tasks, Knowledge Files)
 # Catalog: SLA column, editable & persisted + catalog toolbar
-# Rebranded to Data Buddy — Sidecar Application
+# Rebranded to Data Wizard
 #
 # UPDATE (2026-02-20):
 # - Added "Config File" button next to "Export"
@@ -14,10 +14,17 @@ import json
 import random
 import threading
 import inspect
+import subprocess
+from pathlib import Path
 from datetime import datetime, timedelta
 from collections import Counter, defaultdict
 from difflib import SequenceMatcher
-from app.dbt_generator import generate_dbt_models
+
+# dbt bundle generator (optional)
+try:
+    from app.dbt_generator import generate_dbt_models
+except Exception:
+    generate_dbt_models = None
 import requests
 import wx
 import wx.grid as gridlib
@@ -68,7 +75,7 @@ from app.analysis import (
 # ──────────────────────────────────────────────────────────────────────────────
 
 class KernelManager:
-    def __init__(self, app_name="Data Buddy — Sidecar Application"):
+    def __init__(self, app_name="Data Wizard"):
         self.lock = threading.Lock()
         self.dir = os.path.join(os.path.expanduser("~"), ".sidecar")
         os.makedirs(self.dir, exist_ok=True)
@@ -87,7 +94,12 @@ class KernelManager:
                     "Catalog", "Compliance", "Tasks",
                     "Export CSV", "Export TXT", "Upload to S3",
                     "Config File"
-                ]
+                ,
+                    "Snowflake Bundle",
+                    "Fabric Bundle",
+                    "Purview Export",
+                    "DBT",
+                    "dbt Bundle"]
             },
             "stats": {"launch_count": 0},
             "state": {"last_dataset": None, "kpis": {}, "catalog_meta": {}},
@@ -312,7 +324,7 @@ class KPIBadge(wx.Panel):
 
 class MainWindow(wx.Frame):
     def __init__(self):
-        super().__init__(None, title="Data Buddy — Sidecar Application", size=(1320, 840))
+        super().__init__(None, title="Data Wizard", size=(1320, 840))
 
         # icon (best effort)
         for p in (
@@ -335,6 +347,9 @@ class MainWindow(wx.Frame):
         self.quality_rules = {}
         self.current_process = ""
 
+
+        self._undo_stack = []
+        self._redo_stack = []
         self.metrics = {
             "rows": None, "cols": None, "null_pct": None, "uniqueness": None,
             "dq_score": None, "validity": None, "completeness": None, "anomalies": None,
@@ -361,12 +376,22 @@ class MainWindow(wx.Frame):
         header = wx.Panel(self); header.SetBackgroundColour(HEADER)
         hbox = wx.BoxSizer(wx.HORIZONTAL)
 
-        title = wx.StaticText(header, label="Data Buddy — Sidecar Application")
+        title = wx.StaticText(header, label="Data Wizard")
         title.SetForegroundColour(wx.Colour(255, 255, 255))
         title.SetFont(wx.Font(12, wx.FONTFAMILY_SWISS, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD))
         hbox.Add(title, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 12)
 
         hbox.AddStretchSpacer(1)
+
+        # Connection status (best-effort indicators)
+        self._conn_labels = {}
+        for key in ("AWS", "Snowflake", "dbt", "Fabric"):
+            st = wx.StaticText(header, label=f"{key}: —")
+            st.SetForegroundColour(wx.Colour(230, 225, 255))
+            f = st.GetFont(); f.SetPointSize(8); st.SetFont(f)
+            hbox.Add(st, 0, wx.RIGHT | wx.ALIGN_CENTER_VERTICAL, 10)
+            self._conn_labels[key] = st
+
         self.little_pill = LittleBuddyPill(header, handler=self.on_little_buddy)
         hbox.Add(self.little_pill, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 8)
 
@@ -383,7 +408,7 @@ class MainWindow(wx.Frame):
 
         tb_outer = wx.BoxSizer(wx.HORIZONTAL)
 
-        def _group(title: str, min_w: int, tint=None):
+        def _group(title: str, min_w: int, tint=None, proportion: int = 0, expand: bool = False):
             """Create a labeled 'card' section for toolbar buttons."""
             gp = wx.Panel(toolbar_panel, style=wx.BORDER_SIMPLE)
             gp.SetMinSize((min_w, -1))
@@ -406,7 +431,7 @@ class MainWindow(wx.Frame):
             v.Add(s, 0, wx.EXPAND | wx.ALL, 6)
 
             gp.SetSizer(v)
-            tb_outer.Add(gp, 0, wx.ALL | wx.ALIGN_TOP, 8)
+            tb_outer.Add(gp, proportion, wx.ALL | wx.ALIGN_TOP | (wx.EXPAND if expand else 0), 8)
             return s
 
         def _vsep():
@@ -432,9 +457,9 @@ class MainWindow(wx.Frame):
         tint_analyze = wx.Colour(250, 250, 255)
         tint_actions = wx.Colour(252, 248, 255)
 
-        # Group 1: Data
-        g_data = _group("DATA", 170, tint=tint_data)
-        add_btn(g_data, "Upload", self.on_upload_menu)
+        # Group 1: Data Sources
+        g_data = _group("DATA SOURCES", 240, tint=tint_data)
+        add_btn(g_data, "Connect", self.on_upload_menu)
 
         _vsep()
 
@@ -449,15 +474,27 @@ class MainWindow(wx.Frame):
         _vsep()
 
         # Group 3: Actions
-        g_actions = _group("ACTIONS", 760, tint=tint_actions)
+        g_actions = _group("ACTIONS", 610, tint=tint_actions)
         add_btn(g_actions, "Rule Assignment", self.on_rules)
+        add_btn(g_actions, "Transform", self.on_transform_menu)
+        add_btn(g_actions, "Undo", self.on_undo)
+        add_btn(g_actions, "Redo", self.on_redo)
         add_btn(g_actions, "Knowledge Files", self.on_load_knowledge)
         add_btn(g_actions, "MDM", self.on_mdm)
         add_btn(g_actions, "Synthetic Data", self.on_generate_synth)
         add_btn(g_actions, "To Do", self.on_run_tasks)
-        add_btn(g_actions, "Export", self.on_export_menu)
-        add_btn(g_actions, "Config File", self.on_generate_config_files)
-        add_btn(g_actions, "Snowflake Bundle", self.on_generate_snowflake_bundle)
+        add_btn(g_actions, "DBT", self.on_dbt_menu)
+
+        _vsep()
+
+        # Group 4: Deploy
+        g_deploy = _group("DEPLOY", 700, tint=tint_actions)
+        add_btn(g_deploy, "Export", self.on_export_menu)
+        add_btn(g_deploy, "AWS Glue Bundle", self.on_generate_config_files)
+        add_btn(g_deploy, "Snowflake Bundle", self.on_generate_snowflake_bundle)
+        add_btn(g_deploy, "Fabric Bundle", self.on_generate_fabric_bundle)
+        add_btn(g_deploy, "Purview Export", self.on_purview_export)
+        add_btn(g_deploy, "dbt Bundle", self.on_generate_dbt_bundle)
 
         tb_outer.AddStretchSpacer(1)
         toolbar_panel.SetSizer(tb_outer)
@@ -515,9 +552,14 @@ class MainWindow(wx.Frame):
         self.catalog_toolbar_panel.Hide()
         main.Add(self.catalog_toolbar_panel, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 4)
 
-        # Grid
-        grid_panel = wx.Panel(self); grid_panel.SetBackgroundColour(BG)
-        self.grid = gridlib.Grid(grid_panel); self.grid.CreateGrid(0, 0)
+        # Main content: Grid (top) + Wizard Console (bottom)
+        splitter = wx.SplitterWindow(self, style=wx.SP_LIVE_UPDATE)
+        splitter.SetMinimumPaneSize(140)
+
+        # Top pane: data grid
+        top_panel = wx.Panel(splitter)
+        top_panel.SetBackgroundColour(BG)
+        self.grid = gridlib.Grid(top_panel); self.grid.CreateGrid(0, 0)
         self.grid.SetDefaultCellTextColour(wx.Colour(35, 31, 51))
         self.grid.SetDefaultCellBackgroundColour(wx.Colour(255,255,255))
         self.grid.SetLabelTextColour(wx.Colour(60,60,90))
@@ -527,9 +569,69 @@ class MainWindow(wx.Frame):
         self.grid.SetRowLabelSize(36); self.grid.SetColLabelSize(28)
         self.grid.Bind(wx.EVT_SIZE, self.on_grid_resize)
         self.grid.Bind(gridlib.EVT_GRID_CELL_CHANGED, self.on_cell_changed)
-        gp = wx.BoxSizer(wx.VERTICAL); gp.Add(self.grid, 1, wx.EXPAND | wx.ALL, 8)
-        grid_panel.SetSizer(gp)
-        main.Add(grid_panel, 1, wx.EXPAND | wx.ALL, 4)
+
+        tp = wx.BoxSizer(wx.VERTICAL)
+        tp.Add(self.grid, 1, wx.EXPAND | wx.ALL, 8)
+        top_panel.SetSizer(tp)
+
+        # Bottom pane: Wizard Console (logs/issues/summary + progress)
+        bottom_panel = wx.Panel(splitter)
+        bottom_panel.SetBackgroundColour(wx.Colour(252, 250, 255))
+
+        bp = wx.BoxSizer(wx.VERTICAL)
+
+        console_hdr = wx.BoxSizer(wx.HORIZONTAL)
+        lbl_console = wx.StaticText(bottom_panel, label="Wizard Console")
+        lf = lbl_console.GetFont()
+        lf.SetPointSize(9)
+        lf.SetWeight(wx.FONTWEIGHT_BOLD)
+        lbl_console.SetFont(lf)
+        lbl_console.SetForegroundColour(wx.Colour(44, 31, 72))
+        console_hdr.Add(lbl_console, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 6)
+        console_hdr.AddStretchSpacer(1)
+
+        self.progress_label = wx.StaticText(bottom_panel, label="")
+        self.progress_label.SetForegroundColour(wx.Colour(94, 64, 150))
+        console_hdr.Add(self.progress_label, 0, wx.RIGHT | wx.ALIGN_CENTER_VERTICAL, 8)
+
+        self.progress_gauge = wx.Gauge(bottom_panel, range=100, size=(220, 12), style=wx.GA_HORIZONTAL)
+        self.progress_gauge.SetValue(0)
+        console_hdr.Add(self.progress_gauge, 0, wx.RIGHT | wx.ALIGN_CENTER_VERTICAL, 8)
+
+        bp.Add(console_hdr, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 4)
+        bp.Add(wx.StaticLine(bottom_panel), 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 4)
+
+        nb = wx.Notebook(bottom_panel)
+
+        # Logs tab
+        p_logs = wx.Panel(nb)
+        v_logs = wx.BoxSizer(wx.VERTICAL)
+        self.txt_logs = wx.TextCtrl(p_logs, value="", style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL)
+        v_logs.Add(self.txt_logs, 1, wx.EXPAND | wx.ALL, 8)
+        p_logs.SetSizer(v_logs)
+        nb.AddPage(p_logs, "Logs")
+
+        # Issues tab
+        p_issues = wx.Panel(nb)
+        v_issues = wx.BoxSizer(wx.VERTICAL)
+        self.txt_issues = wx.TextCtrl(p_issues, value="No issues yet.", style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL)
+        v_issues.Add(self.txt_issues, 1, wx.EXPAND | wx.ALL, 8)
+        p_issues.SetSizer(v_issues)
+        nb.AddPage(p_issues, "Issues")
+
+        # Summary tab
+        p_summary = wx.Panel(nb)
+        v_sum = wx.BoxSizer(wx.VERTICAL)
+        self.txt_summary = wx.TextCtrl(p_summary, value="Load a dataset to see summary.", style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL)
+        v_sum.Add(self.txt_summary, 1, wx.EXPAND | wx.ALL, 8)
+        p_summary.SetSizer(v_sum)
+        nb.AddPage(p_summary, "Summary")
+
+        bp.Add(nb, 1, wx.EXPAND | wx.ALL, 6)
+        bottom_panel.SetSizer(bp)
+
+        splitter.SplitHorizontally(top_panel, bottom_panel, sashPosition=520)
+        main.Add(splitter, 1, wx.EXPAND | wx.ALL, 4)
 
         # Menubar
         mb = wx.MenuBar()
@@ -542,6 +644,13 @@ class MainWindow(wx.Frame):
         self.SetMenuBar(mb)
 
         self.SetSizer(main)
+
+        # Periodic connection checks (non-blocking)
+        self._conn_state = {}
+        self._conn_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self._on_conn_timer, self._conn_timer)
+        self._conn_timer.Start(5000)
+        wx.CallAfter(self.refresh_connection_status)
 
     # Knowledge helpers
     def _get_prioritized_knowledge(self):
@@ -593,6 +702,32 @@ class MainWindow(wx.Frame):
         self.card_anoms.SetValue(str(self.metrics["anomalies"]) if self.metrics["anomalies"] is not None else "—")
         self.kernel.set_kpis(self.metrics)
 
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Wizard Console (right pane)
+    # ──────────────────────────────────────────────────────────────────────────
+    def _console_ts(self) -> str:
+        try:
+            return datetime.now().strftime("%H:%M:%S")
+        except Exception:
+            return ""
+
+    def console_log(self, message: str):
+        """Append a line to the Wizard Console log (safe to call from anywhere)."""
+        try:
+            if not hasattr(self, "txt_console") or self.txt_console is None:
+                return
+            line = f"[{self._console_ts()}] {message}\n"
+            self.txt_console.AppendText(line)
+        except Exception:
+            pass
+
+    def console_set_status(self, message: str):
+        try:
+            if hasattr(self, "lbl_console_status") and self.lbl_console_status:
+                self.lbl_console_status.SetLabel(message)
+        except Exception:
+            pass
     # Utils
     @staticmethod
     def _as_df(rows, cols):
@@ -625,21 +760,58 @@ class MainWindow(wx.Frame):
         total_cells = df.shape[0] * max(1, df.shape[1])
         nulls = int(df.isna().sum().sum())
         completeness = (1.0 - (nulls / total_cells)) * 100.0 if total_cells else 0.0
+
         rules = self._compile_rules()
-        checked = 0; valid = 0
-        for col, rx in rules.items():
-            if col in df.columns:
-                for val in df[col].astype(str):
-                    checked += 1
-                    if rx.fullmatch(val) or rx.search(val):
+        checked = 0
+        valid = 0
+
+        # Regex rules can be sensitive to non-string types; normalize values safely.
+        for col, rx in (rules or {}).items():
+            if col not in df.columns:
+                continue
+            # ensure rx is compiled
+            if not hasattr(rx, "search"):
+                try:
+                    rx = re.compile(str(rx))
+                except Exception:
+                    rx = re.compile(".*")
+
+            for raw in df[col].values:
+                checked += 1
+                if raw is None:
+                    s = ""
+                else:
+                    # treat NaN as empty
+                    try:
+                        import pandas as _pd
+                        if isinstance(raw, float) and _pd.isna(raw):
+                            s = ""
+                        else:
+                            s = str(raw)
+                    except Exception:
+                        s = str(raw)
+
+                try:
+                    if rx.fullmatch(s) or rx.search(s):
                         valid += 1
+                except TypeError:
+                    # last resort: cast again
+                    try:
+                        if rx.search(str(s)):
+                            valid += 1
+                    except Exception:
+                        pass
+
         validity = (valid / checked) * 100.0 if checked else None
+
         if self.metrics["uniqueness"] is None or self.metrics["null_pct"] is None:
             null_pct, uniq_pct = self._compute_profile_metrics(df)
             self.metrics["null_pct"] = null_pct
             self.metrics["uniqueness"] = uniq_pct
+
         components = [self.metrics["uniqueness"], completeness]
-        if validity is not None: components.append(validity)
+        if validity is not None:
+            components.append(validity)
         dq_score = sum(components) / len(components) if components else 0.0
         return completeness, validity, dq_score
 
@@ -701,6 +873,12 @@ class MainWindow(wx.Frame):
             self._display(hdr, data)
             self._reset_kpis_for_new_dataset(hdr, data)
             self.kernel.log("load_uri", uri=uri, rows=len(data), cols=len(hdr))
+            self.console_set_status("Dataset loaded")
+            self.console_log(f"Loaded URI: {uri} (rows={len(data)}, cols={len(hdr)})")
+            try:
+                self.txt_summary.SetValue(f"Rows: {len(data)}\nColumns: {len(hdr)}\n\nFields:\n- " + "\n- ".join(map(str, hdr)))
+            except Exception:
+                pass
         except Exception as e:
             wx.MessageBox(f"Could not read from URI:\n{e}", "Load URI", wx.OK | wx.ICON_ERROR)
 
@@ -718,6 +896,12 @@ class MainWindow(wx.Frame):
         self.headers, self.raw_data = hdr, data
         self._display(hdr, data); self._reset_kpis_for_new_dataset(hdr, data)
         self.kernel.log("load_file", path=path, rows=len(data), cols=len(hdr))
+        self.console_set_status("Dataset loaded")
+        self.console_log(f"Loaded file: {path} (rows={len(data)}, cols={len(hdr)})")
+        try:
+            self.txt_summary.SetValue(f"Rows: {len(data)}\nColumns: {len(hdr)}\n\nFields:\n- " + "\n- ".join(map(str, hdr)))
+        except Exception:
+            pass
 
     def on_rules(self, _evt=None):
         if not self.headers:
@@ -732,6 +916,200 @@ class MainWindow(wx.Frame):
         except Exception as e:
             wx.MessageBox(f"Could not open Quality Rule Assignment:\n{e}",
                           "Quality Rules", wx.OK | wx.ICON_ERROR)
+
+# ──────────────────────────────────────────────────────────────────────────
+# Transformations (NEW)
+# ──────────────────────────────────────────────────────────────────────────
+
+def _snapshot_dataset(self):
+    """Return a lightweight snapshot of the current dataset for undo/redo."""
+    return {
+        "headers": list(self.headers or []),
+        "raw_data": [list(r) for r in (self.raw_data or [])],
+        "current_process": self.current_process,
+        "metrics": dict(self.metrics or {}),
+    }
+
+def _restore_dataset(self, snap: dict):
+    self.headers = list(snap.get("headers") or [])
+    self.raw_data = [list(r) for r in (snap.get("raw_data") or [])]
+    self.current_process = snap.get("current_process") or ""
+    # metrics will be recalculated/reset for safety
+    self._display(self.headers, self.raw_data)
+    self._reset_kpis_for_new_dataset(self.headers, self.raw_data)
+    self._show_catalog_toolbar(self.current_process == "Catalog")
+
+def _push_undo(self, reason: str = ""):
+    try:
+        self._undo_stack.append(self._snapshot_dataset())
+        # keep undo bounded
+        if len(self._undo_stack) > 30:
+            self._undo_stack = self._undo_stack[-30:]
+        self._redo_stack = []
+        if reason:
+            self._console_log(f"Undo checkpoint: {reason}")
+    except Exception:
+        pass
+
+def on_undo(self, _evt=None):
+    if not getattr(self, "_undo_stack", None):
+        wx.MessageBox("Nothing to undo.", "Undo", wx.OK | wx.ICON_INFORMATION)
+        return
+    try:
+        cur = self._snapshot_dataset()
+        snap = self._undo_stack.pop()
+        self._redo_stack.append(cur)
+        self._restore_dataset(snap)
+        self._console_log("Undo applied.")
+    except Exception as e:
+        wx.MessageBox(f"Undo failed: {e}", "Undo", wx.OK | wx.ICON_ERROR)
+
+def on_redo(self, _evt=None):
+    if not getattr(self, "_redo_stack", None):
+        wx.MessageBox("Nothing to redo.", "Redo", wx.OK | wx.ICON_INFORMATION)
+        return
+    try:
+        cur = self._snapshot_dataset()
+        snap = self._redo_stack.pop()
+        self._undo_stack.append(cur)
+        self._restore_dataset(snap)
+        self._console_log("Redo applied.")
+    except Exception as e:
+        wx.MessageBox(f"Redo failed: {e}", "Redo", wx.OK | wx.ICON_ERROR)
+
+def on_transform_menu(self, _evt=None):
+    if (not self.headers) and self.grid.GetNumberCols() == 0:
+        wx.MessageBox("Load data first so there is something to transform.", "Transform",
+                      wx.OK | wx.ICON_WARNING)
+        return
+
+    # Use current view columns
+    cols = list(self.headers or [])
+    if not cols and self.grid.GetNumberCols() > 0:
+        cols = [self.grid.GetColLabelValue(i) for i in range(self.grid.GetNumberCols())]
+
+    dlg = TransformDialog(self, columns=cols)
+    if dlg.ShowModal() != wx.ID_OK:
+        dlg.Destroy()
+        return
+    spec = dlg.get_params()
+    dlg.Destroy()
+
+    try:
+        self._push_undo(reason=f"Transform: {spec.get('operation')}")
+        self._apply_transformation(spec)
+        self._console_log(f"Transform complete: {spec.get('operation')}")
+    except Exception as e:
+        import traceback
+        wx.MessageBox(f"Transform failed:\n\n{e}\n\n{traceback.format_exc()}",
+                      "Transform", wx.OK | wx.ICON_ERROR)
+        self.kernel.log("transform_failed", error=str(e), spec=spec)
+
+def _apply_transformation(self, spec: dict):
+    op = (spec.get("operation") or "").strip()
+    df = pd.DataFrame(self.raw_data, columns=self.headers)
+
+    def to_str(x):
+        return "" if x is None else str(x)
+
+    if op == "Trim whitespace (all text)":
+        for c in df.columns:
+            if df[c].dtype == object:
+                df[c] = df[c].map(lambda v: to_str(v).strip())
+        self.kernel.log("transform_trim", cols=len(df.columns))
+
+    elif op == "Normalize column names (snake_case)":
+        new_cols = []
+        for c in df.columns:
+            s = str(c).strip()
+            s = re.sub(r"\s+", "_", s)
+            s = re.sub(r"[^A-Za-z0-9_]+", "_", s)
+            s = re.sub(r"_+", "_", s).strip("_")
+            new_cols.append(s or "col")
+        df.columns = new_cols
+        self.kernel.log("transform_cols_snake_case")
+
+    elif op == "Drop duplicate rows":
+        before = len(df)
+        df = df.drop_duplicates()
+        self.kernel.log("transform_drop_duplicates", before=before, after=len(df))
+
+    elif op == "Fill nulls in column":
+        col = spec.get("column") or ""
+        fill_val = spec.get("value")
+        if col not in df.columns:
+            raise ValueError(f"Column not found: {col}")
+        before_nulls = int(df[col].isna().sum())
+        df[col] = df[col].where(~df[col].isna(), other=fill_val)
+        self.kernel.log("transform_fill_nulls", column=col, before_nulls=before_nulls)
+
+    elif op == "Find & replace (regex)":
+        col = spec.get("column") or ""
+        pattern = spec.get("pattern") or ""
+        repl = spec.get("replacement") or ""
+        if col not in df.columns:
+            raise ValueError(f"Column not found: {col}")
+        rx = re.compile(pattern)
+        df[col] = df[col].map(lambda v: rx.sub(repl, to_str(v)))
+        self.kernel.log("transform_regex_replace", column=col)
+
+    elif op == "Cast column to numeric":
+        col = spec.get("column") or ""
+        if col not in df.columns:
+            raise ValueError(f"Column not found: {col}")
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+        self.kernel.log("transform_cast_numeric", column=col)
+
+    elif op == "Parse column as date":
+        col = spec.get("column") or ""
+        fmt = (spec.get("date_format") or "").strip() or None
+        if col not in df.columns:
+            raise ValueError(f"Column not found: {col}")
+        if fmt:
+            df[col] = pd.to_datetime(df[col], errors="coerce", format=fmt).dt.date.astype(str)
+        else:
+            df[col] = pd.to_datetime(df[col], errors="coerce").dt.date.astype(str)
+        self.kernel.log("transform_parse_date", column=col, fmt=fmt or "auto")
+
+    elif op == "Mask PII (email/phone)":
+        cols = spec.get("columns") or []
+        if not cols:
+            cols = [c for c in df.columns if any(k in c.lower() for k in ["email","phone","mobile","cell"])]
+        for col in cols:
+            if col not in df.columns:
+                continue
+            low = col.lower()
+            if "email" in low:
+                def mask_email(v):
+                    s = to_str(v).strip()
+                    if "@" not in s: 
+                        return s
+                    name, dom = s.split("@", 1)
+                    if len(name) <= 2:
+                        m = "*" * len(name)
+                    else:
+                        m = name[0] + ("*" * (len(name)-2)) + name[-1]
+                    return m + "@" + dom
+                df[col] = df[col].map(mask_email)
+            else:
+                def mask_phone(v):
+                    s = re.sub(r"\D+", "", to_str(v))
+                    if len(s) < 4:
+                        return to_str(v)
+                    return "*" * max(0, len(s)-4) + s[-4:]
+                df[col] = df[col].map(mask_phone)
+        self.kernel.log("transform_mask_pii", columns=cols)
+
+    else:
+        raise ValueError(f"Unsupported transformation: {op}")
+
+    self.headers = list(df.columns)
+    # keep as list-of-lists, stringify for grid stability
+    self.raw_data = df.astype(object).where(pd.notna(df), None).values.tolist()
+    self.current_process = "Transform"
+    self._show_catalog_toolbar(False)
+    self._display(self.headers, self.raw_data)
+    self._reset_kpis_for_new_dataset(self.headers, self.raw_data)
 
     # Settings & Buddy
     def open_settings(self, _evt=None):
@@ -765,7 +1143,141 @@ class MainWindow(wx.Frame):
         except Exception as e:
             wx.MessageBox(f"Little Buddy failed to open:\n{e}", "Little Buddy", wx.OK | wx.ICON_ERROR)
 
-    # Synthetic data (unchanged)
+    
+    # ──────────────────────────────────────────────────────────────────────────
+    # Connection status + progress helpers (NEW)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _on_conn_timer(self, _evt=None):
+        # Refresh in the UI thread; actual network checks are done in worker threads.
+        self.refresh_connection_status()
+
+    def refresh_connection_status(self):
+        """Best-effort connection checks. Never hard-fail the app if a connector isn't installed."""
+        def set_label(name: str, ok: bool, msg: str):
+            lbl = getattr(self, "_conn_labels", {}).get(name)
+            if not lbl:
+                return
+            # soft green/red-ish using text (we keep header background dark)
+            dot = "●"
+            lbl.SetLabel(f"{dot} {name}: {msg}")
+            lbl.SetForegroundColour(wx.Colour(140, 255, 170) if ok else wx.Colour(255, 180, 180))
+
+        def update_state(key, ok, msg):
+            prev = self._conn_state.get(key)
+            cur = (bool(ok), str(msg))
+            self._conn_state[key] = cur
+            if prev != cur:
+                self.console_log(f"Connection {key}: {msg}" if ok else f"Connection {key}: {msg}")
+
+        # AWS (configured vs live)
+        def check_aws():
+            ok = False
+            msg = "not configured"
+            if os.environ.get("AWS_PROFILE") or (os.environ.get("AWS_ACCESS_KEY_ID") and os.environ.get("AWS_SECRET_ACCESS_KEY")):
+                msg = "configured"
+                ok = True
+            # Try a fast STS call if boto3 is available (optional)
+            try:
+                import boto3  # type: ignore
+                try:
+                    sts = boto3.client("sts", region_name=os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION"))
+                    sts.get_caller_identity()
+                    ok = True
+                    msg = "live"
+                except Exception:
+                    # keep configured
+                    pass
+            except Exception:
+                pass
+            wx.CallAfter(set_label, "AWS", ok, msg)
+            wx.CallAfter(update_state, "AWS", ok, msg)
+
+        # Snowflake
+        def check_snowflake():
+            ok = False
+            msg = "not configured"
+            if os.environ.get("SNOWFLAKE_ACCOUNT") and os.environ.get("SNOWFLAKE_USER"):
+                ok = True
+                msg = "configured"
+            try:
+                import snowflake.connector  # type: ignore
+                # Only attempt connect if password/token present to avoid prompting
+                if os.environ.get("SNOWFLAKE_PASSWORD") or os.environ.get("SNOWFLAKE_OAUTH_TOKEN"):
+                    try:
+                        kwargs = dict(
+                            account=os.environ.get("SNOWFLAKE_ACCOUNT"),
+                            user=os.environ.get("SNOWFLAKE_USER"),
+                            warehouse=os.environ.get("SNOWFLAKE_WAREHOUSE") or None,
+                            database=os.environ.get("SNOWFLAKE_DATABASE") or None,
+                            schema=os.environ.get("SNOWFLAKE_SCHEMA") or None,
+                            login_timeout=5,
+                            network_timeout=5,
+                        )
+                        if os.environ.get("SNOWFLAKE_OAUTH_TOKEN"):
+                            kwargs["authenticator"] = "oauth"
+                            kwargs["token"] = os.environ.get("SNOWFLAKE_OAUTH_TOKEN")
+                        else:
+                            kwargs["password"] = os.environ.get("SNOWFLAKE_PASSWORD")
+                        conn = snowflake.connector.connect(**{k:v for k,v in kwargs.items() if v})
+                        cur = conn.cursor()
+                        cur.execute("select 1")
+                        cur.close()
+                        conn.close()
+                        ok = True
+                        msg = "live"
+                    except Exception:
+                        # keep configured
+                        pass
+            except Exception:
+                pass
+            wx.CallAfter(set_label, "Snowflake", ok, msg)
+            wx.CallAfter(update_state, "Snowflake", ok, msg)
+
+        # dbt (installed vs configured)
+        def check_dbt():
+            ok = False
+            msg = "not installed"
+            try:
+                # Use subprocess (fast)
+                cp = subprocess.run(["dbt", "--version"], capture_output=True, text=True, timeout=5, shell=False)
+                if cp.returncode == 0:
+                    ok = True
+                    msg = "installed"
+            except Exception:
+                pass
+            wx.CallAfter(set_label, "dbt", ok, msg)
+            wx.CallAfter(update_state, "dbt", ok, msg)
+
+        # Fabric (best-effort: configured)
+        def check_fabric():
+            ok = False
+            msg = "not configured"
+            if os.environ.get("FABRIC_TENANT_ID") or os.environ.get("POWERBI_TENANT_ID") or os.environ.get("AZURE_TENANT_ID"):
+                ok = True
+                msg = "configured"
+            wx.CallAfter(set_label, "Fabric", ok, msg)
+            wx.CallAfter(update_state, "Fabric", ok, msg)
+
+        for fn in (check_aws, check_snowflake, check_dbt, check_fabric):
+            threading.Thread(target=fn, daemon=True).start()
+
+    def _set_progress(self, pct: int | None = None, msg: str = ""):
+        try:
+            if hasattr(self, "progress_label") and self.progress_label:
+                self.progress_label.SetLabel(msg or "")
+            if hasattr(self, "progress_gauge") and self.progress_gauge:
+                if pct is None:
+                    self.progress_gauge.Pulse()
+                else:
+                    self.progress_gauge.SetValue(max(0, min(100, int(pct))))
+        except Exception:
+            pass
+
+    def _clear_progress(self):
+        self._set_progress(0, "")
+
+# Synthetic data (unchanged)
     @staticmethod
     def _most_common_format(strings, default_mask="DDD-DDD-DDDD"):
         def mask_one(s): return re.sub(r"\d", "D", s)
@@ -1154,7 +1666,10 @@ class MainWindow(wx.Frame):
             wx.MessageBox("Load data first.", "No data", wx.OK | wx.ICON_WARNING); return
 
         self.current_process = proc_name
+        self._set_progress(None, f"Running: {proc_name}")
         df = self._as_df(self.raw_data, self.headers)
+        self.console_set_status(f"Running: {proc_name}")
+        self.console_log(f"Run analysis: {proc_name}")
 
         if proc_name == "Profile":
             try:
@@ -1254,6 +1769,7 @@ class MainWindow(wx.Frame):
             self._show_catalog_toolbar(False)
 
         self._display(hdr, data)
+        self._clear_progress()
 
     # Robust anomaly detector
     def _detect_anomalies(self, df: pd.DataFrame):
@@ -1330,6 +1846,232 @@ class MainWindow(wx.Frame):
 
         work["__anomaly__"] = ["; ".join(r) if r else "" for r in reasons]
         return work, int(flags.sum())
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # NEW: dbt bundle generation (models + schema.yml + optional regex tests)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _default_dbt_project_path(self) -> str:
+        # repo root is one level above /app
+        try:
+            root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        except Exception:
+            root = os.getcwd()
+        # common layout: <repo>/dbt/sidecar_dbt
+        cand = os.path.join(root, "dbt", "sidecar_dbt")
+        return cand if os.path.exists(os.path.join(cand, "dbt_project.yml")) else root
+
+    def _write_text(self, path: str, content: str):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    def _dbt_safe_name(self, s: str, default: str = "model") -> str:
+        s = re.sub(r"[^A-Za-z0-9_]+", "_", (s or "").strip())
+        s = re.sub(r"_+", "_", s).strip("_")
+        return s or default
+
+    def on_generate_dbt_bundle(self, _evt=None):
+        # must have some dataset / fields
+        if (not self.headers) and self.grid.GetNumberCols() == 0:
+            wx.MessageBox("Load data first so we have fields to map.", "dbt Bundle",
+                          wx.OK | wx.ICON_WARNING)
+            return
+
+        dlg = DbtBundleDialog(self, default_project_path=self._default_dbt_project_path())
+        if dlg.ShowModal() != wx.ID_OK:
+            dlg.Destroy()
+            return
+        params = dlg.get_params()
+        dlg.Destroy()
+
+        project_dir = params["project_dir"]
+        if not os.path.exists(os.path.join(project_dir, "dbt_project.yml")):
+            wx.MessageBox(
+                "That folder doesn't look like a dbt project (dbt_project.yml not found).\n\n"
+                f"Folder:\n{project_dir}",
+                "dbt Bundle",
+                wx.OK | wx.ICON_ERROR
+            )
+            return
+
+        try:
+            mappings = self._extract_mapping_from_current_view()
+            now = datetime.utcnow().isoformat() + "Z"
+
+            # Try user's generator first (if present)
+            if callable(generate_dbt_models):
+                try:
+                    generate_dbt_models(mappings=mappings, params=params, project_dir=project_dir, quality_rules=self.quality_rules)
+                    wx.MessageBox("dbt bundle generated via app.dbt_generator.", "dbt Bundle", wx.OK | wx.ICON_INFORMATION)
+                    self.kernel.log("dbt_bundle_generated", via="dbt_generator", project_dir=project_dir, model=params["model_name"])
+                    return
+                except TypeError:
+                    # support older signature styles
+                    try:
+                        generate_dbt_models(mappings, project_dir)
+                        wx.MessageBox("dbt bundle generated via app.dbt_generator.", "dbt Bundle", wx.OK | wx.ICON_INFORMATION)
+                        self.kernel.log("dbt_bundle_generated", via="dbt_generator_legacy", project_dir=project_dir, model=params["model_name"])
+                        return
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            # Fallback: generate a minimal staging model + schema.yml (Snowflake-friendly SQL)
+            model_name = self._dbt_safe_name(params["model_name"], default="stg_data_buddy")
+            src_relation = params["source_relation"].strip()
+            materialized = params["materialized"]
+
+            models_dir = os.path.join(project_dir, "models", "sidecar")
+            macros_dir = os.path.join(project_dir, "macros", "sidecar")
+            out_dir = os.path.join(project_dir, "target", "sidecar_bundle_out")
+            os.makedirs(models_dir, exist_ok=True)
+            os.makedirs(macros_dir, exist_ok=True)
+            os.makedirs(out_dir, exist_ok=True)
+
+            # Build SELECT list
+            select_lines = []
+            for m in mappings:
+                src = (m.get("source_field") or "").strip()
+                tgt = (m.get("target_field") or src).strip()
+                tgt = self._dbt_safe_name(tgt, default=src or "col")
+                # for snowflake casting, prefer catalog_data_type, else target_type
+                dtype_hint = (m.get("catalog_data_type") or m.get("target_type") or "").strip()
+                sf_type = self._guess_snowflake_type_from_catalog(dtype_hint) if dtype_hint else "VARCHAR"
+                if src:
+                    select_lines.append(f'    TRY_CAST({{ adapter.quote("{src}") }} AS {sf_type}) AS {tgt}')
+            if not select_lines:
+                select_lines = ["    *"]
+
+            select_sql = ",\n".join(select_lines)
+
+            sql = f"""{{{{ config(materialized='{materialized}') }}}}
+
+WITH src AS (
+  SELECT * FROM {src_relation}
+)
+SELECT
+{select_sql}
+FROM src
+"""
+            self._write_text(os.path.join(models_dir, f"{model_name}.sql"), sql)
+
+            # Build schema.yml
+            # Add not_null test when Nullable indicates not nullable, and regex tests when quality_rules has a pattern for the field.
+            cols_yml = []
+            need_regex_macro = False
+            rules = self._compile_rules()
+            for m in mappings:
+                src = (m.get("source_field") or "").strip()
+                tgt = (m.get("target_field") or src).strip()
+                tgt = self._dbt_safe_name(tgt, default=src or "col")
+                desc = (m.get("description") or "").strip()
+                nullable = str(m.get("nullable") or "").strip().lower()
+                tests = []
+                if nullable in ("no", "n", "false", "not null", "non-null", "nonnullable"):
+                    tests.append("not_null")
+                if params.get("include_regex_tests", True):
+                    rx = rules.get(src) or rules.get(tgt)
+                    if rx is not None:
+                        need_regex_macro = True
+                        # store regex pattern string if possible
+                        pattern_str = getattr(rx, "pattern", None) or str(rx)
+                        # escape backslashes for yaml string
+                        pattern_str = pattern_str.replace('\\', '\\\\')
+                        tests.append({"regex_match": {"regex": pattern_str}})
+                col_entry = {
+                    "name": tgt,
+                    "description": desc or f"Generated from {src}",
+                }
+                if tests:
+                    col_entry["tests"] = tests
+                cols_yml.append(col_entry)
+            # Write schema.yml (manual YAML to avoid external deps)
+            def y(s):  # basic YAML string esc
+                return (s or "").replace("\\", "\\\\").replace('"', '\\\"')
+
+            lines = []
+            lines.append("version: 2")
+            lines.append("")
+            lines.append("models:")
+            lines.append(f"  - name: {model_name}")
+            lines.append("    description: \"Generated by Data Wizard (Sidecar) dbt bundle generator.\"")
+            lines.append("    columns:")
+            for col in cols_yml:
+                lines.append(f"      - name: {col['name']}")
+                lines.append(f"        description: \"{y(col.get('description',''))}\"")
+                tests = col.get("tests") or []
+                if tests:
+                    lines.append("        tests:")
+                    for t in tests:
+                        if isinstance(t, str):
+                            lines.append(f"          - {t}")
+                        elif isinstance(t, dict) and "regex_match" in t:
+                            rx = t["regex_match"].get("regex","")
+                            lines.append("          - regex_match:")
+                            lines.append(f"              regex: \"{y(rx)}\"")
+            schema_yml = "\n".join(lines) + "\n"
+            self._write_text(os.path.join(models_dir, "schema.yml"), schema_yml)
+
+
+            # Macro for regex test (Snowflake REGEXP_LIKE)
+            if need_regex_macro:
+                macro = """{% test regex_match(model, column_name, regex) %}
+select *
+from {{ model }}
+where {{ column_name }} is not null
+  and not regexp_like({{ column_name }}, regex)
+{% endtest %}
+"""
+                self._write_text(os.path.join(macros_dir, "regex_match.sql"), macro)
+
+            # Human README
+            readme = f"""Data Wizard — dbt Bundle Output
+==========================
+
+Generated at (UTC): {now}
+
+Created:
+- models/sidecar/{model_name}.sql
+- models/sidecar/schema.yml
+- macros/sidecar/regex_match.sql (only if regex tests were enabled and rules existed)
+
+How to run:
+  cd {project_dir}
+  dbt deps   (optional)
+  dbt run -s {model_name}
+  dbt test -s {model_name}
+
+Source relation:
+  {src_relation}
+
+Notes:
+- Column casts use TRY_CAST for safety.
+- not_null tests are added when Nullable is set to "No" in Catalog.
+- regex tests are generated from your Quality Rule Assignment (best-effort).
+"""
+            self._write_text(os.path.join(out_dir, "README.txt"), readme)
+
+            self.kernel.log("dbt_bundle_generated", via="fallback_writer", project_dir=project_dir, model=model_name, mappings=len(mappings))
+            wx.MessageBox(
+                "dbt bundle generated successfully.\n\n"
+                f"Model: {model_name}\n"
+                f"Project: {project_dir}\n\n"
+                "Run:\n  dbt run -s " + model_name + "\n  dbt test -s " + model_name,
+                "dbt Bundle",
+                wx.OK | wx.ICON_INFORMATION
+            )
+
+        except Exception as e:
+            import traceback
+            wx.MessageBox(
+                f"Failed to generate dbt bundle:\n\n{e}\n\n{traceback.format_exc()}",
+                "dbt Bundle",
+                wx.OK | wx.ICON_ERROR
+            )
+            self.kernel.log("dbt_bundle_failed", error=str(e))
 
     # ──────────────────────────────────────────────────────────────────────────
     # NEW: Config File generation (AWS Pipeline configs + mappings)
@@ -1466,7 +2208,7 @@ class MainWindow(wx.Frame):
             now = datetime.utcnow().isoformat() + "Z"
 
             # Derive a few helpful things
-            pipeline_name = params.get("pipeline_name") or "data-buddy-pipeline"
+            pipeline_name = params.get("pipeline_name") or "data-wizard-pipeline"
             safe_name = self._safe_filename(pipeline_name, default="pipeline")
             out_prefix = os.path.join(out_dir, safe_name)
             os.makedirs(out_prefix, exist_ok=True)
@@ -1474,7 +2216,7 @@ class MainWindow(wx.Frame):
             # Save params (what the user typed)
             pipeline_params = {
                 "generated_at": now,
-                "generated_by": "Data Buddy — Sidecar Application",
+                "generated_by": "Data Wizard",
                 "pipeline_name": pipeline_name,
                 "aws_region": params.get("aws_region", "us-east-1"),
                 "source": {
@@ -1512,7 +2254,7 @@ class MainWindow(wx.Frame):
                 "schema_version": "1.0",
                 "generated_at": now,
                 "app": {
-                    "name": "Data Buddy — Sidecar Application",
+                    "name": "Data Wizard",
                     "kernel_path": getattr(self.kernel, "path", ""),
                 },
                 "pipeline": {
@@ -1554,7 +2296,7 @@ class MainWindow(wx.Frame):
             readme_path = os.path.join(out_prefix, "README.txt")
             with open(readme_path, "w", encoding="utf-8") as f:
                 f.write(
-                    "Data Buddy — AWS Pipeline Config Output\n"
+                    "Data Wizard — AWS Pipeline Config Output\n"
                     "=====================================\n\n"
                     f"Generated at (UTC): {now}\n\n"
                     "Files:\n"
@@ -1659,7 +2401,7 @@ class MainWindow(wx.Frame):
             mappings = self._extract_mapping_from_current_view()
             now = datetime.utcnow().isoformat() + "Z"
 
-            bundle_name = params.get("bundle_name") or "data_buddy_snowflake_bundle"
+            bundle_name = params.get("bundle_name") or "data_wizard_snowflake_bundle"
             safe_name = self._safe_filename(bundle_name, default="snowflake_bundle")
             out_prefix = os.path.join(out_dir, safe_name)
             os.makedirs(out_prefix, exist_ok=True)
@@ -1692,13 +2434,13 @@ class MainWindow(wx.Frame):
             if not cols_sql:
                 cols_sql = ['  "COL" VARCHAR']
 
-            db = (params.get("database") or "").strip() or "DATA_BUDDY"
+            db = (params.get("database") or "").strip() or "DATA_WIZARD"
             schema = (params.get("schema") or "").strip() or "PUBLIC"
-            role = (params.get("role") or "").strip() or "DATA_BUDDY_ROLE"
-            wh = (params.get("warehouse") or "").strip() or "DATA_BUDDY_WH"
+            role = (params.get("role") or "").strip() or "DATA_WIZARD_ROLE"
+            wh = (params.get("warehouse") or "").strip() or "DATA_WIZARD_WH"
             table = (params.get("target_table") or "").strip() or "INGEST_TABLE"
-            stage = (params.get("stage") or "").strip() or "DATA_BUDDY_STAGE"
-            file_format = (params.get("file_format") or "").strip() or "DATA_BUDDY_FF"
+            stage = (params.get("stage") or "").strip() or "DATA_WIZARD_STAGE"
+            file_format = (params.get("file_format") or "").strip() or "DATA_WIZARD_FF"
 
             src_type = params.get("source_type", "s3")
             src_url = (params.get("source_url") or "").strip()
@@ -1706,7 +2448,7 @@ class MainWindow(wx.Frame):
 
             # SQL scripts
             setup_sql = f"""-- 00_setup.sql
--- Generated by Data Buddy at {now}
+-- Generated by Data Wizard at {now}
 -- Optional: adjust security objects to your standards
 
 -- Warehouse
@@ -1824,7 +2566,7 @@ ON_ERROR = '{params.get('on_error','CONTINUE')}';
                 with open(os.path.join(out_prefix, name), "w", encoding="utf-8") as f:
                     f.write(content)
 
-            readme = f"""Data Buddy — Snowflake Bundle
+            readme = f"""Data Wizard — Snowflake Bundle
 ===========================
 
 Generated at (UTC): {now}
@@ -1884,6 +2626,726 @@ Notes:
                 wx.OK | wx.ICON_ERROR
             )
             self.kernel.log("snowflake_bundle_failed", error=str(e))
+
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # NEW: Microsoft Fabric Bundle generation (Lakehouse/Pipeline placeholders + mappings)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def on_generate_fabric_bundle(self, _evt=None):
+        """
+        Generates a Fabric starter bundle from your current mapping:
+        - fabric_params.json
+        - field_mappings.json / field_mappings.csv
+        - 00_lakehouse.sql (optional DDL idea)
+        - 01_dataflow_gen2_notes.txt (how to wire)
+        - 02_pipeline_notes.txt (how to run)
+        - README.txt
+        """
+        if (not self.headers) and self.grid.GetNumberCols() == 0:
+            wx.MessageBox("Load data first so we have fields to map.", "Fabric Bundle",
+                          wx.OK | wx.ICON_WARNING)
+            return
+
+        dlg = FabricBundleDialog(self)
+        if dlg.ShowModal() != wx.ID_OK:
+            dlg.Destroy()
+            return
+        params = dlg.get_params()
+        dlg.Destroy()
+
+        dd = wx.DirDialog(self, "Choose output folder for the Fabric bundle",
+                          style=wx.DD_DEFAULT_STYLE | wx.DD_DIR_MUST_EXIST)
+        if dd.ShowModal() != wx.ID_OK:
+            dd.Destroy()
+            return
+        out_dir = dd.GetPath()
+        dd.Destroy()
+
+        try:
+            mappings = self._extract_mapping_from_current_view()
+            now = datetime.utcnow().isoformat() + "Z"
+
+            bundle_name = params.get("bundle_name") or "data_wizard_fabric_bundle"
+            safe_name = self._safe_filename(bundle_name, default="fabric_bundle")
+            out_prefix = os.path.join(out_dir, safe_name)
+            os.makedirs(out_prefix, exist_ok=True)
+
+            # save params + mappings
+            with open(os.path.join(out_prefix, "fabric_params.json"), "w", encoding="utf-8") as f:
+                json.dump({"generated_at": now, **params}, f, ensure_ascii=False, indent=2)
+
+            with open(os.path.join(out_prefix, "field_mappings.json"), "w", encoding="utf-8") as f:
+                json.dump({"generated_at": now, "mappings": mappings}, f, ensure_ascii=False, indent=2)
+            pd.DataFrame(mappings).to_csv(os.path.join(out_prefix, "field_mappings.csv"), index=False)
+
+            # Optional: a Lakehouse table DDL idea (Spark SQL style)
+            lakehouse = (params.get("lakehouse_name") or "data_wizard_lakehouse").strip() or "data_wizard_lakehouse"
+            table = (params.get("table_name") or "stg_ingest").strip() or "stg_ingest"
+
+            cols = []
+            for m in mappings:
+                col = (m.get("target_field") or m.get("source_field") or "col").strip()
+                col = re.sub(r"[^A-Za-z0-9_]+", "_", col).strip("_") or "col"
+                dtype = (m.get("target_type") or "string").strip().lower()
+                # Fabric Lakehouse uses Spark types; reuse glue mapping heuristics
+                spark_type = self._guess_glue_type_from_catalog(m.get("catalog_data_type") or dtype)
+                cols.append(f"  {col} {spark_type}")
+            if not cols:
+                cols = ["  col string"]
+
+            ddl = (
+                f"-- 00_lakehouse.sql\n"
+                f"-- Generated by Data Wizard at {now}\n\n"
+                f"-- Run in a Fabric Lakehouse SQL endpoint (or Spark SQL notebook as needed).\n"
+                f"CREATE TABLE IF NOT EXISTS {table} (\n" + ",\n".join(cols) + "\n);\n"
+            )
+            with open(os.path.join(out_prefix, "00_lakehouse.sql"), "w", encoding="utf-8") as f:
+                f.write(ddl)
+
+            # Notes: Dataflow Gen2 + Pipeline wiring
+            df_notes = (
+                "01_dataflow_gen2_notes.txt\n"
+                "===========================\n\n"
+                "Goal: land raw files into OneLake/Lakehouse and create a staging table.\n\n"
+                "Typical pattern:\n"
+                "1) Create a Lakehouse in Fabric.\n"
+                "2) Use Dataflow Gen2 to ingest from your source (S3 / ADLS / SharePoint / etc).\n"
+                "3) Map/rename columns using field_mappings.csv.\n"
+                "4) Output to Lakehouse table.\n\n"
+                "Use the mapping files in this bundle to keep names/types consistent.\n"
+            )
+            with open(os.path.join(out_prefix, "01_dataflow_gen2_notes.txt"), "w", encoding="utf-8") as f:
+                f.write(df_notes)
+
+            pipe_notes = (
+                "02_pipeline_notes.txt\n"
+                "======================\n\n"
+                "Goal: orchestrate ingestion + transformation.\n\n"
+                "Typical pattern:\n"
+                "- Fabric Pipeline activity: refresh Dataflow Gen2\n"
+                "- Notebook activity: run transformations (Spark)\n"
+                "- Optional: dbt (external) to build semantic models in Snowflake/Fabric Warehouse\n\n"
+                "If you want, we can add a 'Run Fabric Pipeline via REST' button next.\n"
+            )
+            with open(os.path.join(out_prefix, "02_pipeline_notes.txt"), "w", encoding="utf-8") as f:
+                f.write(pipe_notes)
+
+            readme = (
+                "Data Wizard — Fabric Bundle\n"
+                "===========================\n\n"
+                f"Generated at (UTC): {now}\n\n"
+                "Files:\n"
+                "- fabric_params.json\n"
+                "- field_mappings.json\n"
+                "- field_mappings.csv\n"
+                "- 00_lakehouse.sql\n"
+                "- 01_dataflow_gen2_notes.txt\n"
+                "- 02_pipeline_notes.txt\n\n"
+                "Next:\n"
+                "- Use Dataflow Gen2 to ingest and map fields.\n"
+                "- Use the SQL/Notebook placeholders to create tables/transforms.\n"
+            )
+            with open(os.path.join(out_prefix, "README.txt"), "w", encoding="utf-8") as f:
+                f.write(readme)
+
+            self.kernel.log("fabric_bundle_generated", out_dir=out_prefix, lakehouse=lakehouse, table=table, mappings=len(mappings))
+            wx.MessageBox(
+                "Fabric bundle generated successfully.\n\n"
+                f"Folder:\n{out_prefix}\n\n"
+                "Created:\n"
+                "- fabric_params.json\n"
+                "- field_mappings.json\n"
+                "- field_mappings.csv\n"
+                "- 00_lakehouse.sql\n"
+                "- 01_dataflow_gen2_notes.txt\n"
+                "- 02_pipeline_notes.txt\n"
+                "- README.txt",
+                "Fabric Bundle",
+                wx.OK | wx.ICON_INFORMATION
+            )
+        except Exception as e:
+            import traceback
+            wx.MessageBox(f"Failed to generate Fabric bundle:\n\n{e}\n\n{traceback.format_exc()}",
+                          "Fabric Bundle", wx.OK | wx.ICON_ERROR)
+            self.kernel.log("fabric_bundle_failed", error=str(e))
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # NEW: Microsoft Purview export (catalog meta + quality rules + mappings)
+    # ──────────────────────────────────────────────────────────────────────────
+
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # NEW: Purview Export (metadata export for Microsoft Purview bulk import / reference)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def on_purview_export(self, _evt=None):
+        """Export current catalog/mapping metadata into Purview-friendly CSV + JSON.
+
+        Notes:
+        - This does NOT call Purview APIs (no credentials needed).
+        - Output can be used as a starting point for bulk entity creation, documentation, or import tooling.
+        """
+        # must have some dataset / fields
+        if (not self.headers) and self.grid.GetNumberCols() == 0:
+            wx.MessageBox("Load data first so we have fields to export.", "Purview Export",
+                          wx.OK | wx.ICON_WARNING)
+            return
+
+        # Collect a couple identifiers for qualifiedName shaping
+        with wx.TextEntryDialog(self, "Enter a Source System / Collection name (ex: CRM, ERP, S3_Lake):",
+                                "Purview Export", value="DATA_WIZARD") as d:
+            if d.ShowModal() != wx.ID_OK:
+                return
+            source_system = (d.GetValue() or "").strip() or "DATA_WIZARD"
+
+        with wx.TextEntryDialog(self, "Enter a Dataset/Table name (ex: customers, orders):",
+                                "Purview Export", value="dataset") as d:
+            if d.ShowModal() != wx.ID_OK:
+                return
+            dataset_name = (d.GetValue() or "").strip() or "dataset"
+
+        # choose output folder
+        dd = wx.DirDialog(self, "Choose output folder for Purview export",
+                          style=wx.DD_DEFAULT_STYLE | wx.DD_DIR_MUST_EXIST)
+        if dd.ShowModal() != wx.ID_OK:
+            dd.Destroy()
+            return
+        out_dir = dd.GetPath()
+        dd.Destroy()
+
+        try:
+            now = datetime.utcnow().isoformat() + "Z"
+            mappings = self._extract_mapping_from_current_view()
+
+            # Compile regex rules (best-effort) for reference
+            rules = self._compile_rules()
+
+            rows = []
+            for m in mappings:
+                src = (m.get("source_field") or "").strip()
+                tgt = (m.get("target_field") or src).strip()
+                desc = (m.get("description") or "").strip()
+                nullable = (m.get("nullable") or "").strip()
+                sla = (m.get("sla") or "").strip()
+
+                dtype_hint = (m.get("catalog_data_type") or m.get("target_type") or "").strip()
+                # Purview is typeName-based; keep a friendly dtype column for humans/tools
+                dtype_out = dtype_hint or "string"
+
+                rx = rules.get(src) or rules.get(tgt)
+                rx_pat = getattr(rx, "pattern", "") if rx is not None else ""
+
+                # Very simple qualifiedName scheme you can change later
+                # (Purview requires unique qualifiedName per asset)
+                qn = f"{source_system}::{dataset_name}::{tgt or src}"
+
+                rows.append({
+                    "typeName": "DataSetColumn",
+                    "qualifiedName": qn,
+                    "name": tgt or src,
+                    "sourceField": src,
+                    "description": desc,
+                    "dataType": dtype_out,
+                    "nullable": nullable,
+                    "sla": sla,
+                    "qualityRuleRegex": rx_pat,
+                    "generatedAtUtc": now,
+                })
+
+            safe_source = self._safe_filename(source_system, default="source")
+            safe_dataset = self._safe_filename(dataset_name, default="dataset")
+            out_prefix = os.path.join(out_dir, f"purview_{safe_source}_{safe_dataset}")
+            os.makedirs(out_prefix, exist_ok=True)
+
+            csv_path = os.path.join(out_prefix, "purview_columns.csv")
+            pd.DataFrame(rows).to_csv(csv_path, index=False)
+
+            json_path = os.path.join(out_prefix, "purview_export.json")
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "generated_at": now,
+                    "app": "Data Wizard — Sidecar Application",
+                    "source_system": source_system,
+                    "dataset": dataset_name,
+                    "rows": len(rows),
+                    "columns": rows,
+                }, f, ensure_ascii=False, indent=2)
+
+            readme_path = os.path.join(out_prefix, "README.txt")
+            with open(readme_path, "w", encoding="utf-8") as f:
+                f.write(
+                    "Data Wizard — Purview Export\n"
+                    "===========================\n\n"
+                    f"Generated at (UTC): {now}\n\n"
+                    "Files:\n"
+                    "- purview_columns.csv   (tabular export of column metadata)\n"
+                    "- purview_export.json   (same data as JSON)\n\n"
+                    "Notes:\n"
+                    "- This is a metadata export for Microsoft Purview-style workflows.\n"
+                    "- qualifiedName format used here is: <SourceSystem>::<Dataset>::<Column>\n"
+                    "- Update the qualifiedName convention to match your organization's Purview naming standard.\n"
+                    "- qualityRuleRegex is best-effort from Rule Assignment (if rules were set).\n"
+                )
+
+            self.kernel.log(
+                "purview_export_generated",
+                out_dir=out_prefix,
+                source_system=source_system,
+                dataset=dataset_name,
+                rows=len(rows),
+            )
+
+            wx.MessageBox(
+                "Purview export generated successfully.\n\n"
+                f"Folder:\n{out_prefix}\n\n"
+                "Created:\n"
+                "- purview_columns.csv\n"
+                "- purview_export.json\n"
+                "- README.txt",
+                "Purview Export",
+                wx.OK | wx.ICON_INFORMATION
+            )
+
+        except Exception as e:
+            import traceback
+            wx.MessageBox(
+                f"Failed to generate Purview export:\n\n{e}\n\n{traceback.format_exc()}",
+                "Purview Export",
+                wx.OK | wx.ICON_ERROR
+            )
+            self.kernel.log("purview_export_failed", error=str(e))
+    def on_generate_purview_export(self, _evt=None):
+        """
+        Exports Sidecar metadata in a Purview-friendly package (best-effort):
+        - purview_export.json  (catalog meta + rules + mappings)
+        - purview_catalog.csv  (Field, Friendly Name, Description, Data Type, Nullable, SLA)
+        - purview_rules.csv    (Field, Rule)
+        - field_mappings.csv   (reuse)
+        - README.txt
+        """
+        if (not self.headers) and self.grid.GetNumberCols() == 0 and not self._load_catalog_meta():
+            wx.MessageBox("Load data or run Catalog first so we have metadata to export.", "Purview Export",
+                          wx.OK | wx.ICON_WARNING)
+            return
+
+        dlg = PurviewExportDialog(self)
+        if dlg.ShowModal() != wx.ID_OK:
+            dlg.Destroy()
+            return
+        params = dlg.get_params()
+        dlg.Destroy()
+
+        dd = wx.DirDialog(self, "Choose output folder for the Purview export",
+                          style=wx.DD_DEFAULT_STYLE | wx.DD_DIR_MUST_EXIST)
+        if dd.ShowModal() != wx.ID_OK:
+            dd.Destroy()
+            return
+        out_dir = dd.GetPath()
+        dd.Destroy()
+
+        try:
+            now = datetime.utcnow().isoformat() + "Z"
+            export_name = params.get("export_name") or "data_wizard_purview_export"
+            safe_name = self._safe_filename(export_name, default="purview_export")
+            out_prefix = os.path.join(out_dir, safe_name)
+            os.makedirs(out_prefix, exist_ok=True)
+
+            mappings = self._extract_mapping_from_current_view() if (self.headers or self.grid.GetNumberCols() > 0) else []
+            meta = self._load_catalog_meta()
+            rules = {k: (getattr(v, "pattern", None) or str(v)) for k, v in (self.quality_rules or {}).items()}
+
+            # Build a flattened catalog table from meta (and/or mappings)
+            rows = []
+            # prefer meta keys; if empty, fall back to mappings
+            if meta:
+                for field, vals in meta.items():
+                    rows.append({
+                        "Field": field,
+                        "Friendly Name": vals.get("Friendly Name", ""),
+                        "Description": vals.get("Description", ""),
+                        "Data Type": vals.get("Data Type", ""),
+                        "Nullable": vals.get("Nullable", ""),
+                        "SLA": vals.get("SLA", ""),
+                    })
+            else:
+                for m in mappings:
+                    rows.append({
+                        "Field": m.get("source_field",""),
+                        "Friendly Name": m.get("target_field",""),
+                        "Description": m.get("description",""),
+                        "Data Type": m.get("catalog_data_type","") or m.get("target_type",""),
+                        "Nullable": m.get("nullable",""),
+                        "SLA": m.get("sla",""),
+                    })
+
+            pd.DataFrame(rows).to_csv(os.path.join(out_prefix, "purview_catalog.csv"), index=False)
+
+            rules_rows = [{"Field": k, "Rule": v} for k, v in rules.items()]
+            pd.DataFrame(rules_rows).to_csv(os.path.join(out_prefix, "purview_rules.csv"), index=False)
+
+            if mappings:
+                pd.DataFrame(mappings).to_csv(os.path.join(out_prefix, "field_mappings.csv"), index=False)
+
+            export_obj = {
+                "generated_at": now,
+                "generated_by": "Data Wizard",
+                "export": params,
+                "catalog_meta": meta,
+                "quality_rules": rules,
+                "mappings": mappings,
+            }
+            with open(os.path.join(out_prefix, "purview_export.json"), "w", encoding="utf-8") as f:
+                json.dump(export_obj, f, ensure_ascii=False, indent=2)
+
+            readme = (
+                "Data Wizard — Purview Export\n"
+                "============================\n\n"
+                f"Generated at (UTC): {now}\n\n"
+                "This is a best-effort package to help you load metadata into Microsoft Purview.\n\n"
+                "Files:\n"
+                "- purview_export.json  (full export)\n"
+                "- purview_catalog.csv  (field-level metadata)\n"
+                "- purview_rules.csv    (quality rules as regex / text)\n"
+                "- field_mappings.csv   (if available)\n\n"
+                "Next:\n"
+                "- Use Purview Data Map bulk update patterns or automation to apply descriptions/classifications.\n"
+                "- If you want, we can add: Purview CSV template formats (entities/attributes) and REST API push.\n"
+            )
+            with open(os.path.join(out_prefix, "README.txt"), "w", encoding="utf-8") as f:
+                f.write(readme)
+
+            self.kernel.log("purview_export_generated", out_dir=out_prefix, fields=len(rows), rules=len(rules))
+            wx.MessageBox(
+                "Purview export generated successfully.\n\n"
+                f"Folder:\n{out_prefix}\n\n"
+                "Created:\n"
+                "- purview_export.json\n"
+                "- purview_catalog.csv\n"
+                "- purview_rules.csv\n"
+                "- (optional) field_mappings.csv\n"
+                "- README.txt",
+                "Purview Export",
+                wx.OK | wx.ICON_INFORMATION
+            )
+        except Exception as e:
+            import traceback
+            wx.MessageBox(f"Failed to generate Purview export:\n\n{e}\n\n{traceback.format_exc()}",
+                          "Purview Export", wx.OK | wx.ICON_ERROR)
+            self.kernel.log("purview_export_failed", error=str(e))
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # DBT integration (NEW)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _default_dbt_project_dir(self) -> str:
+        """Best-effort path to the dbt project within this repo."""
+        try:
+            root = Path(__file__).resolve().parents[1]  # repo root (../)
+        except Exception:
+            root = Path(os.getcwd())
+        return str(root / "dbt" / "sidecar_dbt")
+
+    def on_dbt_menu(self, _evt=None):
+        """DBT actions menu."""
+        menu = wx.Menu()
+        m_generate = menu.Append(wx.ID_ANY, "Generate dbt models from current mapping…")
+        m_run      = menu.Append(wx.ID_ANY, "dbt run")
+        m_test     = menu.Append(wx.ID_ANY, "dbt test")
+        m_build    = menu.Append(wx.ID_ANY, "dbt build")
+        menu.AppendSeparator()
+        m_open     = menu.Append(wx.ID_ANY, "Open dbt project folder")
+        self.Bind(wx.EVT_MENU, lambda e: self.on_dbt_generate_models(), m_generate)
+        self.Bind(wx.EVT_MENU, lambda e: self.on_dbt_run_cmd("run"), m_run)
+        self.Bind(wx.EVT_MENU, lambda e: self.on_dbt_run_cmd("test"), m_test)
+        self.Bind(wx.EVT_MENU, lambda e: self.on_dbt_run_cmd("build"), m_build)
+        self.Bind(wx.EVT_MENU, lambda e: self.on_dbt_open_folder(), m_open)
+        self.PopupMenu(menu)
+        menu.Destroy()
+
+    def on_dbt_open_folder(self, _evt=None):
+        p = self._default_dbt_project_dir()
+        try:
+            if os.path.isdir(p):
+                os.startfile(p)  # Windows
+            else:
+                wx.MessageBox(f"dbt project folder not found:\n{p}", "DBT", wx.OK | wx.ICON_WARNING)
+        except Exception as e:
+            wx.MessageBox(f"Could not open folder:\n{e}", "DBT", wx.OK | wx.ICON_ERROR)
+
+        def on_dbt_generate_models(self, _evt=None):
+            """Generate dbt models + tests based on current mapping and (optionally) quality rules.
+
+            NOTE: app.dbt_generator is optional. If it's not installed, we fall back to a built-in writer
+            that creates a simple staging model + schema.yml (+ optional regex macro).
+            """
+            if (not self.headers) and self.grid.GetNumberCols() == 0:
+                wx.MessageBox("Load data first so we have fields to map.", "DBT", wx.OK | wx.ICON_WARNING)
+                return
+
+            dlg = DbtGenerateDialog(self, default_project_dir=self._default_dbt_project_dir())
+            if dlg.ShowModal() != wx.ID_OK:
+                dlg.Destroy()
+                return
+            opts = dlg.get_params()
+            dlg.Destroy()
+
+            project_dir = opts.get("project_dir") or self._default_dbt_project_dir()
+            if not os.path.exists(os.path.join(project_dir, "dbt_project.yml")):
+                wx.MessageBox(
+                    "That folder doesn't look like a dbt project (dbt_project.yml not found).\n\n"
+                    f"Folder:\n{project_dir}",
+                    "DBT",
+                    wx.OK | wx.ICON_ERROR
+                )
+                return
+
+            try:
+                mappings = self._extract_mapping_from_current_view()
+                # Quality rules may contain compiled regex OR raw strings
+                rules = self._compile_rules()
+
+                # If the optional external generator exists, use it.
+                if callable(generate_dbt_models):
+                    out = generate_dbt_models(
+                        dbt_project_dir=project_dir,
+                        dataset_name=opts.get("dataset_name") or "sidecar",
+                        source_database=opts.get("source_database") or "",
+                        source_schema=opts.get("source_schema") or "",
+                        source_table=opts.get("source_table") or "",
+                        target_schema=opts.get("target_schema") or "",
+                        mappings=mappings,
+                        quality_rules=dict(self.quality_rules or {}),
+                        materialization=opts.get("materialization") or "view",
+                    )
+                    self.kernel.log("dbt_models_generated", via="dbt_generator", project_dir=project_dir, **(out or {}))
+                    wx.MessageBox(
+                        "dbt files generated successfully.\n\n"
+                        f"Project: {project_dir}\n"
+                        f"Models folder: {(out or {}).get('models_dir','models')}",
+                        "DBT",
+                        wx.OK | wx.ICON_INFORMATION
+                    )
+                    return
+
+                # ── Fallback generator (no app.dbt_generator installed) ───────────────────
+                now = datetime.utcnow().isoformat() + "Z"
+                dataset = self._dbt_safe_name(opts.get("dataset_name") or "sidecar", default="sidecar")
+                src_db = (opts.get("source_database") or "").strip()
+                src_schema = (opts.get("source_schema") or "").strip()
+                src_table = (opts.get("source_table") or "").strip() or "RAW_TABLE"
+                tgt_schema = (opts.get("target_schema") or "").strip() or src_schema or "PUBLIC"
+                materialized = (opts.get("materialization") or "view").strip().lower()
+
+                model_name = self._dbt_safe_name(f"stg_{dataset}_{src_table}", default="stg_data_wizard")
+                models_dir = os.path.join(project_dir, "models", "data_wizard")
+                macros_dir = os.path.join(project_dir, "macros", "data_wizard")
+                out_dir = os.path.join(project_dir, "target", "data_wizard_generate_out")
+                os.makedirs(models_dir, exist_ok=True)
+                os.makedirs(macros_dir, exist_ok=True)
+                os.makedirs(out_dir, exist_ok=True)
+
+                # Source relation: best-effort fully-qualified (works for Snowflake)
+                # If you prefer dbt sources, set Source Relation in the Bundle dialog and use "dbt Bundle".
+                if src_db and src_schema and src_table:
+                    src_relation = f'{src_db}.{src_schema}.{src_table}'
+                elif src_schema and src_table:
+                    src_relation = f'{src_schema}.{src_table}'
+                else:
+                    src_relation = src_table
+
+                # Build SELECT list (Snowflake-friendly TRY_CAST)
+                select_lines = []
+                for m in mappings:
+                    src = (m.get("source_field") or "").strip()
+                    if not src:
+                        continue
+                    tgt = (m.get("target_field") or src).strip()
+                    tgt = self._dbt_safe_name(tgt, default=src or "col")
+                    dtype_hint = (m.get("catalog_data_type") or m.get("target_type") or "").strip()
+                    sf_type = self._guess_snowflake_type_from_catalog(dtype_hint) if dtype_hint else "VARCHAR"
+                    select_lines.append(f'  TRY_CAST({{{{ adapter.quote("{src}") }}}} AS {sf_type}) AS {tgt}')
+                if not select_lines:
+                    select_sql = "  *"
+                else:
+                    select_sql = ",\n".join(select_lines)
+
+                sql = (
+                    """{{{{ config(materialized='{materialized}', schema='{tgt_schema}') }}}}
+
+    WITH src AS (
+      SELECT * FROM {src_relation}
+    )
+    SELECT
+    {select_sql}
+    FROM src
+    """.format(
+                        materialized=materialized,
+                        tgt_schema=tgt_schema,
+                        src_relation=src_relation,
+                        select_sql=select_sql,
+                    )
+                )
+                self._write_text(os.path.join(models_dir, f"{model_name}.sql"), sql)
+
+                # Build schema.yml (tests)
+                cols_yml = []
+                need_regex_macro = False
+                for m in mappings:
+                    src = (m.get("source_field") or "").strip()
+                    if not src:
+                        continue
+                    tgt = (m.get("target_field") or src).strip()
+                    tgt = self._dbt_safe_name(tgt, default=src or "col")
+                    desc = (m.get("description") or "").strip()
+                    nullable = str(m.get("nullable") or "").strip().lower()
+
+                    tests = []
+                    # Catalog-driven not_null
+                    if nullable in ("no", "n", "false", "not null", "non-null", "nonnullable"):
+                        tests.append("not_null")
+
+                    # Heuristic: id fields should be not_null + unique
+                    if tgt.lower() in ("id",) or tgt.lower().endswith("_id"):
+                        if "not_null" not in tests:
+                            tests.append("not_null")
+                        tests.append("unique")
+
+                    # Regex from Quality Rules (best-effort)
+                    rx = rules.get(src) or rules.get(tgt)
+                    if rx is not None:
+                        need_regex_macro = True
+                        pattern_str = getattr(rx, "pattern", None) or str(rx)
+                        # YAML escape
+                        pattern_str = pattern_str.replace('\\', '\\\\')
+                        tests.append({"regex_match": {"regex": pattern_str}})
+
+                    entry = {
+                        "name": tgt,
+                        "description": desc or f"Generated from {src}",
+                    }
+                    if tests:
+                        entry["tests"] = tests
+                    cols_yml.append(entry)
+
+                def y(s):
+                    return (s or "").replace("\\", "\\\\").replace('"', '\\"')
+
+                lines = []
+                lines.append("version: 2")
+                lines.append("")
+                lines.append("models:")
+                lines.append(f"  - name: {model_name}")
+                lines.append(f"    description: \"Generated by Data Wizard (fallback dbt generator).\"")
+                lines.append("    columns:")
+                for col in cols_yml:
+                    lines.append(f"      - name: {col['name']}")
+                    lines.append(f"        description: \"{y(col.get('description',''))}\"")
+                    tests = col.get("tests") or []
+                    if tests:
+                        lines.append("        tests:")
+                        for t in tests:
+                            if isinstance(t, str):
+                                lines.append(f"          - {t}")
+                            elif isinstance(t, dict) and "regex_match" in t:
+                                rxv = t["regex_match"].get("regex", "")
+                                lines.append("          - regex_match:")
+                                lines.append(f"              regex: \"{y(rxv)}\"")
+                schema_yml = "\n".join(lines) + "\n"
+                self._write_text(os.path.join(models_dir, "schema.yml"), schema_yml)
+
+                if need_regex_macro:
+                    macro = """{% test regex_match(model, column_name, regex) %}
+    select *
+    from {{ model }}
+    where {{ column_name }} is not null
+      and not regexp_like({{ column_name }}, regex)
+    {% endtest %}
+    """
+                    self._write_text(os.path.join(macros_dir, "regex_match.sql"), macro)
+
+                readme = f"""Data Wizard — dbt Generate Output (fallback)
+    ========================================
+
+    Generated at (UTC): {now}
+
+    Created:
+    - models/data_wizard/{model_name}.sql
+    - models/data_wizard/schema.yml
+    - macros/data_wizard/regex_match.sql (only if regex rules existed)
+
+    How to run:
+      cd {project_dir}
+      dbt run -s {model_name}
+      dbt test -s {model_name}
+
+    Source relation (best-effort):
+      {src_relation}
+
+    Notes:
+    - This fallback does not create sources.yml. If you want sources-based models, use 'dbt Bundle'.
+    """
+                self._write_text(os.path.join(out_dir, "README.txt"), readme)
+
+                self.kernel.log(
+                    "dbt_models_generated",
+                    via="fallback_writer",
+                    project_dir=project_dir,
+                    model=model_name,
+                    models_dir=models_dir,
+                    macros_dir=macros_dir,
+                )
+                wx.MessageBox(
+                    "dbt files generated (fallback writer).\n\n"
+                    f"Project: {project_dir}\n"
+                    f"Model: {model_name}\n\n"
+                    "Next: DBT -> dbt run / dbt test",
+                    "DBT",
+                    wx.OK | wx.ICON_INFORMATION
+                )
+
+            except Exception as e:
+                import traceback
+                wx.MessageBox(f"DBT generate failed:\n\n{e}\n\n{traceback.format_exc()}",
+                              "DBT", wx.OK | wx.ICON_ERROR)
+                self.kernel.log("dbt_models_generate_failed", error=str(e))
+    def on_dbt_run_cmd(self, cmd: str, _evt=None):
+        """Run a dbt command (run/test/build) and stream logs in a dialog."""
+        project_dir = self._default_dbt_project_dir()
+
+        dlg = DbtRunDialog(self, default_project_dir=project_dir, default_cmd=cmd)
+        if dlg.ShowModal() != wx.ID_OK:
+            dlg.Destroy()
+            return
+        opts = dlg.get_params()
+        dlg.Destroy()
+
+        project_dir = opts.get("project_dir") or project_dir
+        cmd = opts.get("cmd") or cmd
+        target = opts.get("target") or None
+        profiles_dir = opts.get("profiles_dir") or None
+
+        self.kernel.log("dbt_command_started", cmd=cmd, project_dir=project_dir, target=target)
+
+        # Run in background thread
+        def worker():
+            from app.dbt_runner import run_dbt_capture
+            rc, output = run_dbt_capture(project_dir=project_dir, cmd=cmd, target=target, profiles_dir=profiles_dir)
+            def done():
+                title = "DBT Success" if rc == 0 else "DBT Failed"
+                icon = wx.ICON_INFORMATION if rc == 0 else wx.ICON_ERROR
+                wx.MessageBox(f"{title}.\n\nExit code: {rc}\n\nSee the log window for details.",
+                              "DBT", wx.OK | icon)
+            wx.CallAfter(self._show_dbt_log, f"dbt {cmd}", output, rc)
+            wx.CallAfter(done)
+            self.kernel.log("dbt_command_finished", cmd=cmd, rc=rc)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_dbt_log(self, title: str, text: str, rc: int):
+        dlg = DbtLogDialog(self, title=f"{title} (exit {rc})", text=text)
+        dlg.ShowModal()
+        dlg.Destroy()
 
     # Tasks / export / upload
     def on_run_tasks(self, _evt=None):
@@ -2146,9 +3608,350 @@ Notes:
         event.Skip(); wx.CallAfter(self.adjust_grid)
 
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# dbt bundle dialog (NEW)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class DbtBundleDialog(wx.Dialog):
+    def __init__(self, parent, default_project_path=""):
+        super().__init__(
+            parent,
+            title="Generate dbt Bundle",
+            style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER
+        )
+        self.SetMinSize((660, 420))
+
+        outer = wx.BoxSizer(wx.VERTICAL)
+
+        panel = wx.Panel(self)
+        v = wx.BoxSizer(wx.VERTICAL)
+
+        hint = wx.StaticText(panel, label=(
+            "Generates a starter dbt model + schema.yml from your current grid mappings.\n"
+            "Tip: Run Catalog first so Data Type / Nullable / Description / SLA are included.\n"
+            "Tip: Quality Rule Assignment regex rules can become dbt tests (optional)."
+        ))
+        v.Add(hint, 0, wx.ALL, 10)
+
+        grid = wx.FlexGridSizer(0, 2, 8, 10)
+        grid.AddGrowableCol(1, 1)
+
+        def add_row(label, ctrl):
+            grid.Add(wx.StaticText(panel, label=label), 0, wx.ALIGN_CENTER_VERTICAL)
+            grid.Add(ctrl, 1, wx.EXPAND)
+
+        self.txt_project = wx.TextCtrl(panel, value=default_project_path)
+        btn_browse = wx.Button(panel, label="Browse…")
+
+        prj_line = wx.BoxSizer(wx.HORIZONTAL)
+        prj_line.Add(self.txt_project, 1, wx.EXPAND | wx.RIGHT, 8)
+        prj_line.Add(btn_browse, 0)
+
+        grid.Add(wx.StaticText(panel, label="dbt Project Folder"), 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(prj_line, 1, wx.EXPAND)
+
+        self.txt_source_relation = wx.TextCtrl(panel, value='{{ source("raw", "your_table") }}')
+        add_row("Source Relation", self.txt_source_relation)
+
+        self.txt_model = wx.TextCtrl(panel, value="stg_data_buddy")
+        add_row("Model Name", self.txt_model)
+
+        self.cbo_mat = wx.Choice(panel, choices=["view", "table"])
+        self.cbo_mat.SetSelection(0)
+        add_row("Materialized", self.cbo_mat)
+
+        self.chk_regex = wx.CheckBox(panel, label="Create regex tests from Quality Rules (best-effort)")
+        self.chk_regex.SetValue(True)
+        grid.Add(wx.StaticText(panel, label="Quality Tests"), 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self.chk_regex, 0)
+
+        v.Add(grid, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
+        v.Add(wx.StaticLine(panel), 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 8)
+
+        btns = wx.StdDialogButtonSizer()
+        ok = wx.Button(panel, wx.ID_OK)
+        ca = wx.Button(panel, wx.ID_CANCEL)
+        btns.AddButton(ok); btns.AddButton(ca); btns.Realize()
+        v.Add(btns, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
+
+        panel.SetSizer(v)
+        outer.Add(panel, 1, wx.EXPAND)
+        self.SetSizer(outer)
+        self.Layout()
+
+        def on_browse(_):
+            dd = wx.DirDialog(self, "Select dbt project folder (contains dbt_project.yml)")
+            if dd.ShowModal() == wx.ID_OK:
+                self.txt_project.SetValue(dd.GetPath())
+            dd.Destroy()
+
+        btn_browse.Bind(wx.EVT_BUTTON, on_browse)
+
+    def get_params(self):
+        return {
+            "project_dir": self.txt_project.GetValue().strip(),
+            "source_relation": self.txt_source_relation.GetValue().strip(),
+            "model_name": self.txt_model.GetValue().strip(),
+            "materialized": self.cbo_mat.GetStringSelection(),
+            "include_regex_tests": self.chk_regex.GetValue(),
+        }
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Config dialog (NEW)
 # ──────────────────────────────────────────────────────────────────────────────
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DBT dialogs (NEW)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class DbtGenerateDialog(wx.Dialog):
+    def __init__(self, parent, default_project_dir=""):
+        super().__init__(parent, title="Generate dbt Models", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.SetMinSize((700, 520))
+
+        outer = wx.BoxSizer(wx.VERTICAL)
+        panel = wx.Panel(self)
+        panel.SetBackgroundColour(wx.Colour(252, 250, 255))
+        v = wx.BoxSizer(wx.VERTICAL)
+
+        hint = wx.StaticText(panel, label=(
+            "This generates dbt models from your current field mappings.\n"
+            "Use this when your raw data is landing in Snowflake (or another warehouse) and you want Sidecar to generate the dbt project assets.\n"
+            "You can then run dbt run/test/build from within Sidecar."
+        ))
+        v.Add(hint, 0, wx.ALL, 10)
+
+        grid = wx.FlexGridSizer(0, 2, 10, 12)
+        grid.AddGrowableCol(1, 1)
+
+        def add_row(label, ctrl):
+            grid.Add(wx.StaticText(panel, label=label), 0, wx.ALIGN_CENTER_VERTICAL)
+            grid.Add(ctrl, 1, wx.EXPAND)
+
+        self.txt_project = wx.TextCtrl(panel, value=default_project_dir)
+        self.txt_dataset = wx.TextCtrl(panel, value="sidecar")
+
+        self.txt_src_db = wx.TextCtrl(panel, value="DATAWIZARD_DB")
+        self.txt_src_schema = wx.TextCtrl(panel, value="DATAWIZARD_SCHEMA")
+        self.txt_src_table = wx.TextCtrl(panel, value="RAW_TABLE")
+
+        self.txt_target_schema = wx.TextCtrl(panel, value="DATAWIZARD_SCHEMA")
+        self.cbo_mat = wx.Choice(panel, choices=["view", "table", "incremental"])
+        self.cbo_mat.SetSelection(0)
+
+        add_row("dbt Project Folder", self.txt_project)
+        add_row("Dataset Name (prefix)", self.txt_dataset)
+        add_row("Source Database", self.txt_src_db)
+        add_row("Source Schema", self.txt_src_schema)
+        add_row("Source Table", self.txt_src_table)
+        add_row("Target Schema (dbt models)", self.txt_target_schema)
+        add_row("Materialization", self.cbo_mat)
+
+        v.Add(grid, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+
+        # folder picker
+        h = wx.BoxSizer(wx.HORIZONTAL)
+        btn_pick = wx.Button(panel, label="Browse…")
+        h.Add(btn_pick, 0, wx.RIGHT, 8)
+        h.Add(wx.StaticText(panel, label="Tip: choose your repo's dbt/sidecar_dbt folder."), 0, wx.ALIGN_CENTER_VERTICAL)
+        v.Add(h, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
+
+        def on_pick(_):
+            d = wx.DirDialog(self, "Select dbt project directory", defaultPath=self.txt_project.GetValue() or "")
+            if d.ShowModal() == wx.ID_OK:
+                self.txt_project.SetValue(d.GetPath())
+            d.Destroy()
+        btn_pick.Bind(wx.EVT_BUTTON, on_pick)
+
+        panel.SetSizer(v)
+        outer.Add(panel, 1, wx.EXPAND | wx.ALL, 10)
+
+        btns = wx.StdDialogButtonSizer()
+        ok = wx.Button(self, wx.ID_OK)
+        ca = wx.Button(self, wx.ID_CANCEL)
+        btns.AddButton(ok); btns.AddButton(ca); btns.Realize()
+        outer.Add(btns, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
+        self.SetSizer(outer)
+        self.Layout()
+
+    def get_params(self):
+        return {
+            "project_dir": self.txt_project.GetValue().strip(),
+            "dataset_name": self.txt_dataset.GetValue().strip(),
+            "source_database": self.txt_src_db.GetValue().strip(),
+            "source_schema": self.txt_src_schema.GetValue().strip(),
+            "source_table": self.txt_src_table.GetValue().strip(),
+            "target_schema": self.txt_target_schema.GetValue().strip(),
+            "materialization": self.cbo_mat.GetStringSelection(),
+        }
+
+
+class DbtRunDialog(wx.Dialog):
+    def __init__(self, parent, default_project_dir="", default_cmd="run"):
+        super().__init__(parent, title="Run dbt Command", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.SetMinSize((700, 420))
+
+        outer = wx.BoxSizer(wx.VERTICAL)
+        panel = wx.Panel(self)
+        v = wx.BoxSizer(wx.VERTICAL)
+
+        hint = wx.StaticText(panel, label=(
+            "Runs dbt using your installed dbt-core/dbt-snowflake.\n"
+            "If you already configured C:\\Users\\<you>\\.dbt\\profiles.yml, you can leave Profiles Dir blank."
+        ))
+        v.Add(hint, 0, wx.ALL, 10)
+
+        grid = wx.FlexGridSizer(0, 2, 10, 12)
+        grid.AddGrowableCol(1, 1)
+
+        def add_row(label, ctrl):
+            grid.Add(wx.StaticText(panel, label=label), 0, wx.ALIGN_CENTER_VERTICAL)
+            grid.Add(ctrl, 1, wx.EXPAND)
+
+        self.txt_project = wx.TextCtrl(panel, value=default_project_dir)
+        self.cbo_cmd = wx.Choice(panel, choices=["run", "test", "build", "compile", "docs generate"])
+        try:
+            self.cbo_cmd.SetStringSelection(default_cmd)
+        except Exception:
+            self.cbo_cmd.SetSelection(0)
+        self.txt_target = wx.TextCtrl(panel, value="dev")
+        self.txt_profiles = wx.TextCtrl(panel, value="")  # optional
+
+        add_row("dbt Project Folder", self.txt_project)
+        add_row("Command", self.cbo_cmd)
+        add_row("Target (profiles.yml)", self.txt_target)
+        add_row("Profiles Dir (optional)", self.txt_profiles)
+
+        v.Add(grid, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+
+        panel.SetSizer(v)
+        outer.Add(panel, 1, wx.EXPAND | wx.ALL, 10)
+
+        btns = wx.StdDialogButtonSizer()
+        ok = wx.Button(self, wx.ID_OK)
+        ca = wx.Button(self, wx.ID_CANCEL)
+        btns.AddButton(ok); btns.AddButton(ca); btns.Realize()
+        outer.Add(btns, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
+
+        self.SetSizer(outer)
+        self.Layout()
+
+    def get_params(self):
+        return {
+            "project_dir": self.txt_project.GetValue().strip(),
+            "cmd": self.cbo_cmd.GetStringSelection(),
+            "target": self.txt_target.GetValue().strip(),
+            "profiles_dir": self.txt_profiles.GetValue().strip(),
+        }
+
+
+class DbtLogDialog(wx.Dialog):
+    def __init__(self, parent, title="DBT Log", text=""):
+        super().__init__(parent, title=title, style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.SetMinSize((900, 650))
+        v = wx.BoxSizer(wx.VERTICAL)
+
+        self.txt = wx.TextCtrl(self, value=text or "", style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL)
+        v.Add(self.txt, 1, wx.EXPAND | wx.ALL, 10)
+
+        btns = wx.StdDialogButtonSizer()
+        ok = wx.Button(self, wx.ID_OK)
+        btns.AddButton(ok); btns.Realize()
+        v.Add(btns, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
+
+        self.SetSizer(v)
+        self.Layout()
+
+
+class TransformDialog(wx.Dialog):
+    def __init__(self, parent, columns=None):
+        super().__init__(parent, title="Transform Data", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.SetMinSize((720, 520))
+        self.columns = list(columns or [])
+
+        outer = wx.BoxSizer(wx.VERTICAL)
+        panel = wx.Panel(self)
+        v = wx.BoxSizer(wx.VERTICAL)
+
+        hint = wx.StaticText(panel, label=(
+            "Apply common transformations to the currently loaded dataset.\n"
+            "Tip: Use Undo/Redo in Actions to roll changes back and forth."
+        ))
+        v.Add(hint, 0, wx.ALL, 10)
+
+        grid = wx.FlexGridSizer(0, 2, 10, 12)
+        grid.AddGrowableCol(1, 1)
+
+        def add_row(label, ctrl):
+            grid.Add(wx.StaticText(panel, label=label), 0, wx.ALIGN_CENTER_VERTICAL)
+            grid.Add(ctrl, 1, wx.EXPAND)
+
+        self.cbo_op = wx.Choice(panel, choices=[
+            "Trim whitespace (all text)",
+            "Normalize column names (snake_case)",
+            "Drop duplicate rows",
+            "Fill nulls in column",
+            "Find & replace (regex)",
+            "Cast column to numeric",
+            "Parse column as date",
+            "Mask PII (email/phone)",
+        ])
+        self.cbo_op.SetSelection(0)
+        add_row("Operation", self.cbo_op)
+
+        self.cbo_col = wx.Choice(panel, choices=self.columns)
+        if self.columns:
+            self.cbo_col.SetSelection(0)
+        add_row("Column (when needed)", self.cbo_col)
+
+        self.txt_value = wx.TextCtrl(panel, value="")
+        add_row("Value (Fill nulls)", self.txt_value)
+
+        self.txt_pattern = wx.TextCtrl(panel, value="")
+        add_row("Regex Pattern", self.txt_pattern)
+
+        self.txt_repl = wx.TextCtrl(panel, value="")
+        add_row("Replacement", self.txt_repl)
+
+        self.txt_datefmt = wx.TextCtrl(panel, value="")
+        add_row("Date Format (optional)", self.txt_datefmt)
+
+        self.lst_cols = wx.CheckListBox(panel, choices=self.columns)
+        add_row("Mask columns (optional)", self.lst_cols)
+
+        v.Add(grid, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+
+        v.Add(wx.StaticLine(panel), 0, wx.EXPAND | wx.ALL, 10)
+
+        btns = wx.StdDialogButtonSizer()
+        ok = wx.Button(panel, wx.ID_OK)
+        ca = wx.Button(panel, wx.ID_CANCEL)
+        btns.AddButton(ok); btns.AddButton(ca); btns.Realize()
+        v.Add(btns, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
+
+        panel.SetSizer(v)
+        outer.Add(panel, 1, wx.EXPAND)
+        self.SetSizer(outer)
+        self.Layout()
+
+    def get_params(self):
+        op = self.cbo_op.GetStringSelection()
+        col = self.cbo_col.GetStringSelection() if self.cbo_col.GetCount() else ""
+        checked_cols = [self.lst_cols.GetString(i) for i in range(self.lst_cols.GetCount()) if self.lst_cols.IsChecked(i)]
+        return {
+            "operation": op,
+            "column": col,
+            "value": self.txt_value.GetValue(),
+            "pattern": self.txt_pattern.GetValue(),
+            "replacement": self.txt_repl.GetValue(),
+            "date_format": self.txt_datefmt.GetValue(),
+            "columns": checked_cols,
+        }
+
 
 class ConfigFileDialog(wx.Dialog):
     def __init__(self, parent):
@@ -2182,7 +3985,7 @@ class ConfigFileDialog(wx.Dialog):
             grid.Add(wx.StaticText(panel, label=label), 0, wx.ALIGN_CENTER_VERTICAL)
             grid.Add(ctrl, 1, wx.EXPAND)
 
-        self.txt_pipeline = wx.TextCtrl(panel, value="data-buddy-pipeline")
+        self.txt_pipeline = wx.TextCtrl(panel, value="data-wizard-pipeline")
         self.txt_region = wx.TextCtrl(panel, value=os.environ.get("AWS_REGION", "us-east-1"))
         self.cbo_source_type = wx.Choice(panel, choices=["s3", "http", "local"])
         self.cbo_source_type.SetSelection(0)
@@ -2340,17 +4143,17 @@ class SnowflakeBundleDialog(wx.Dialog):
             grid.Add(ctrl, 1, wx.EXPAND)
 
         # Naming
-        self.txt_bundle_name = wx.TextCtrl(panel, value="data_buddy_snowflake_bundle")
+        self.txt_bundle_name = wx.TextCtrl(panel, value="data_wizard_snowflake_bundle")
 
         # Core Snowflake objects
-        self.txt_database = wx.TextCtrl(panel, value="DATA_BUDDY")
+        self.txt_database = wx.TextCtrl(panel, value="DATA_WIZARD")
         self.txt_schema = wx.TextCtrl(panel, value="PUBLIC")
-        self.txt_warehouse = wx.TextCtrl(panel, value="DATA_BUDDY_WH")
-        self.txt_role = wx.TextCtrl(panel, value="DATA_BUDDY_ROLE")
+        self.txt_warehouse = wx.TextCtrl(panel, value="DATA_WIZARD_WH")
+        self.txt_role = wx.TextCtrl(panel, value="DATA_WIZARD_ROLE")
 
         self.txt_target_table = wx.TextCtrl(panel, value="INGEST_TABLE")
-        self.txt_stage = wx.TextCtrl(panel, value="DATA_BUDDY_STAGE")
-        self.txt_file_format = wx.TextCtrl(panel, value="DATA_BUDDY_FF")
+        self.txt_stage = wx.TextCtrl(panel, value="DATA_WIZARD_STAGE")
+        self.txt_file_format = wx.TextCtrl(panel, value="DATA_WIZARD_FF")
 
         # Source / stage config
         self.cbo_source_type = wx.Choice(panel, choices=["s3", "azure", "gcs", "existing_stage"])
@@ -2479,6 +4282,110 @@ class SnowflakeBundleDialog(wx.Dialog):
         }
 
 # ──────────────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Fabric bundle dialog (NEW)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class FabricBundleDialog(wx.Dialog):
+    def __init__(self, parent):
+        super().__init__(parent, title="Generate Fabric Bundle", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.SetMinSize((660, 420))
+
+        outer = wx.BoxSizer(wx.VERTICAL)
+        panel = wx.Panel(self)
+        v = wx.BoxSizer(wx.VERTICAL)
+
+        hint = wx.StaticText(panel, label=(
+            "Generates a Microsoft Fabric starter bundle (Lakehouse/pipeline placeholders + mappings).\n"
+            "Tip: Run Catalog first so Data Type / Nullable / Description / SLA are included."
+        ))
+        v.Add(hint, 0, wx.ALL, 10)
+
+        grid = wx.FlexGridSizer(0, 2, 8, 10)
+        grid.AddGrowableCol(1, 1)
+
+        def add_row(label, ctrl):
+            grid.Add(wx.StaticText(panel, label=label), 0, wx.ALIGN_CENTER_VERTICAL)
+            grid.Add(ctrl, 1, wx.EXPAND)
+
+        self.txt_bundle = wx.TextCtrl(panel, value="data_wizard_fabric_bundle")
+        self.txt_lakehouse = wx.TextCtrl(panel, value="data_wizard_lakehouse")
+        self.txt_table = wx.TextCtrl(panel, value="stg_ingest")
+
+        add_row("Bundle Name", self.txt_bundle)
+        add_row("Lakehouse Name (reference)", self.txt_lakehouse)
+        add_row("Table Name (reference)", self.txt_table)
+
+        v.Add(grid, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
+        btns = wx.StdDialogButtonSizer()
+        ok = wx.Button(panel, wx.ID_OK)
+        ca = wx.Button(panel, wx.ID_CANCEL)
+        btns.AddButton(ok); btns.AddButton(ca); btns.Realize()
+        v.Add(btns, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
+
+        panel.SetSizer(v)
+        outer.Add(panel, 1, wx.EXPAND)
+        self.SetSizer(outer)
+        self.Layout()
+
+    def get_params(self):
+        return {
+            "bundle_name": self.txt_bundle.GetValue().strip(),
+            "lakehouse_name": self.txt_lakehouse.GetValue().strip(),
+            "table_name": self.txt_table.GetValue().strip(),
+        }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Purview export dialog (NEW)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class PurviewExportDialog(wx.Dialog):
+    def __init__(self, parent):
+        super().__init__(parent, title="Generate Purview Export", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.SetMinSize((660, 360))
+
+        outer = wx.BoxSizer(wx.VERTICAL)
+        panel = wx.Panel(self)
+        v = wx.BoxSizer(wx.VERTICAL)
+
+        hint = wx.StaticText(panel, label=(
+            "Exports catalog metadata + quality rules + mappings into CSV/JSON files.\n"
+            "This is a best-effort package to help automate Microsoft Purview loading."
+        ))
+        v.Add(hint, 0, wx.ALL, 10)
+
+        grid = wx.FlexGridSizer(0, 2, 8, 10)
+        grid.AddGrowableCol(1, 1)
+
+        def add_row(label, ctrl):
+            grid.Add(wx.StaticText(panel, label=label), 0, wx.ALIGN_CENTER_VERTICAL)
+            grid.Add(ctrl, 1, wx.EXPAND)
+
+        self.txt_export = wx.TextCtrl(panel, value="data_wizard_purview_export")
+        add_row("Export Name", self.txt_export)
+
+        v.Add(grid, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
+        btns = wx.StdDialogButtonSizer()
+        ok = wx.Button(panel, wx.ID_OK)
+        ca = wx.Button(panel, wx.ID_CANCEL)
+        btns.AddButton(ok); btns.AddButton(ca); btns.Realize()
+        v.Add(btns, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
+
+        panel.SetSizer(v)
+        outer.Add(panel, 1, wx.EXPAND)
+        self.SetSizer(outer)
+        self.Layout()
+
+    def get_params(self):
+        return {
+            "export_name": self.txt_export.GetValue().strip(),
+        }
+
+
 # MDM dialog used above (kept here to keep file self-contained)
 # ──────────────────────────────────────────────────────────────────────────────
 
