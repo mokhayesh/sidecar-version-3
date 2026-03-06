@@ -251,7 +251,7 @@ class LittleBuddyPill(wx.Control):
         super().__init__(parent, style=wx.BORDER_NONE)
         self._label = label; self._handler = handler
         self._hover = False; self._down = False
-        self._h = 40; self.SetMinSize((150, self._h))
+        self._h = 34; self.SetMinSize((142, self._h))
         self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
         self.Bind(wx.EVT_ERASE_BACKGROUND, lambda e: None)
         self.Bind(wx.EVT_PAINT, self.on_paint)
@@ -364,58 +364,34 @@ class MainWindow(wx.Frame):
     def _build_ui(self):
         BG = _C("BG")
         HEADER = _C("HEADER")
-        PANEL = _C("PANEL")
-        TEXT_PRIMARY = _C("TEXT_PRIMARY")
         TEXT_MUTED = _C("TEXT_MUTED")
-        BORDER = _C("BORDER")
 
         self.SetBackgroundColour(BG)
         main = wx.BoxSizer(wx.VERTICAL)
 
-        # Header bar: title (left) + Little Buddy (right)
-        header = wx.Panel(self); header.SetBackgroundColour(HEADER)
-        hbox = wx.BoxSizer(wx.HORIZONTAL)
+        def add_btn(sizer, label, handler):
+            parent_win = None
+            try:
+                parent_win = sizer.GetContainingWindow()
+            except Exception:
+                parent_win = None
+            if parent_win is None:
+                parent_win = self
+            b = RoundedShadowButton(parent_win, label, handler)
+            try:
+                b._padx = 14
+                b._pady = 7
+            except Exception:
+                pass
+            sizer.Add(b, 0, wx.ALL, 5)
+            return b
 
-        title = wx.StaticText(header, label="Data Wizard")
-        title.SetForegroundColour(wx.Colour(255, 255, 255))
-        title.SetFont(wx.Font(12, wx.FONTFAMILY_SWISS, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD))
-        hbox.Add(title, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 12)
-
-        hbox.AddStretchSpacer(1)
-
-        # Connection status (best-effort indicators)
-        self._conn_labels = {}
-        for key in ("AWS", "Snowflake", "dbt", "Fabric"):
-            st = wx.StaticText(header, label=f"{key}: —")
-            st.SetForegroundColour(wx.Colour(230, 225, 255))
-            f = st.GetFont(); f.SetPointSize(8); st.SetFont(f)
-            hbox.Add(st, 0, wx.RIGHT | wx.ALIGN_CENTER_VERTICAL, 10)
-            self._conn_labels[key] = st
-
-        self.little_pill = LittleBuddyPill(header, handler=getattr(self, 'on_little_buddy', lambda e: wx.MessageBox('Little Buddy handler missing (on_little_buddy).','Little Buddy', wx.OK|wx.ICON_ERROR)))
-        hbox.Add(self.little_pill, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 8)
-
-        header.SetSizer(hbox)
-        main.Add(header, 0, wx.EXPAND)
-
-        # Buttons toolbar (premium groups-as-cards with horizontal scroll)
-        toolbar_scroller = wx.ScrolledWindow(self, style=wx.HSCROLL)
-        toolbar_scroller.SetScrollRate(10, 0)
-        toolbar_scroller.SetBackgroundColour(BG)
-
-        toolbar_panel = wx.Panel(toolbar_scroller)
-        toolbar_panel.SetBackgroundColour(BG)
-
-        tb_outer = wx.BoxSizer(wx.HORIZONTAL)
-
-        def _group(title: str, min_w: int, tint=None, proportion: int = 0, expand: bool = False):
-            """Create a labeled 'card' section for toolbar buttons."""
-            gp = wx.Panel(toolbar_panel, style=wx.BORDER_SIMPLE)
-            gp.SetMinSize((min_w, -1))
+        def make_section(parent, title: str, min_w: int = 220, tint=None):
+            gp = wx.Panel(parent, style=wx.BORDER_SIMPLE)
             gp.SetBackgroundColour(_C("CARD") if tint is None else tint)
+            gp.SetMinSize((min_w, -1))
 
             v = wx.BoxSizer(wx.VERTICAL)
-
             lbl = wx.StaticText(gp, label=title)
             lf = lbl.GetFont()
             lf.SetPointSize(8)
@@ -426,55 +402,136 @@ class MainWindow(wx.Frame):
             v.Add(lbl, 0, wx.LEFT | wx.TOP | wx.RIGHT, 10)
             v.Add(wx.StaticLine(gp), 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 6)
 
-            # Wrap within the group (buttons wrap only inside the group if needed)
-            s = wx.WrapSizer(wx.HORIZONTAL)
-            v.Add(s, 0, wx.EXPAND | wx.ALL, 6)
-
+            wrap = wx.WrapSizer(wx.HORIZONTAL)
+            v.Add(wrap, 0, wx.EXPAND | wx.ALL, 6)
             gp.SetSizer(v)
-            tb_outer.Add(gp, proportion, wx.ALL | wx.ALIGN_TOP | (wx.EXPAND if expand else 0), 8)
-            return s
+            return gp, wrap
 
-        def _vsep():
-            line = wx.StaticLine(toolbar_panel, style=wx.LI_VERTICAL)
-            tb_outer.Add(line, 0, wx.EXPAND | wx.TOP | wx.BOTTOM, 10)
+        def make_status_chip(parent, name: str):
+            chip = wx.Panel(parent)
+            chip.SetBackgroundColour(wx.Colour(76, 48, 134))
+            chip_sizer = wx.BoxSizer(wx.HORIZONTAL)
+            chip_sizer.AddSpacer(8)
+            lbl = wx.StaticText(chip, label=f"{name}: checking")
+            lbl.SetForegroundColour(wx.Colour(235, 230, 255))
+            f = lbl.GetFont()
+            f.SetPointSize(8)
+            lbl.SetFont(f)
+            chip_sizer.Add(lbl, 0, wx.ALIGN_CENTER_VERTICAL | wx.TOP | wx.BOTTOM, 4)
+            chip_sizer.AddSpacer(8)
+            chip.SetSizer(chip_sizer)
+            return chip, lbl
 
-        def add_btn(sizer, label, handler):
-            # IMPORTANT: parent must match the window that owns the sizer,
-            # otherwise wx will assert: CheckExpectedParentIs(...)
-            parent_win = None
-            try:
-                parent_win = sizer.GetContainingWindow()
-            except Exception:
-                parent_win = None
-            if parent_win is None:
-                parent_win = toolbar_panel
-            b = RoundedShadowButton(parent_win, label, handler)
-            sizer.Add(b, 0, wx.ALL, 6)
-            return b
+        # Header bar: slimmer title area + horizontally spaced connection chips + Little Buddy
+        header = wx.Panel(self)
+        header.SetBackgroundColour(HEADER)
+        hbox = wx.BoxSizer(wx.HORIZONTAL)
 
-        # Subtle tints per section (still on-brand)
-        tint_data    = wx.Colour(252, 250, 255)
+        title_wrap = wx.BoxSizer(wx.VERTICAL)
+        title = wx.StaticText(header, label="Data Wizard")
+        title.SetForegroundColour(wx.Colour(255, 255, 255))
+        title.SetFont(wx.Font(12, wx.FONTFAMILY_SWISS, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD))
+        subtitle = wx.StaticText(header, label="Profile, quality, catalog, transformation, deployment")
+        subtitle.SetForegroundColour(wx.Colour(214, 205, 247))
+        sf = subtitle.GetFont()
+        sf.SetPointSize(7)
+        subtitle.SetFont(sf)
+        title_wrap.Add(title, 0, wx.BOTTOM, 1)
+        title_wrap.Add(subtitle, 0)
+        hbox.Add(title_wrap, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 10)
+        hbox.AddStretchSpacer(1)
+
+        right_header = wx.BoxSizer(wx.HORIZONTAL)
+
+        status_row = wx.Panel(header)
+        status_row.SetBackgroundColour(HEADER)
+        status_sizer = wx.BoxSizer(wx.HORIZONTAL)
+
+        status_title = wx.StaticText(status_row, label="Connections")
+        status_title.SetForegroundColour(wx.Colour(230, 225, 255))
+        stf = status_title.GetFont()
+        stf.SetPointSize(8)
+        stf.SetWeight(wx.FONTWEIGHT_BOLD)
+        status_title.SetFont(stf)
+        status_sizer.Add(status_title, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+
+        self._conn_labels = {}
+        for idx, key in enumerate(("AWS", "Snowflake", "dbt", "Fabric")):
+            chip, st = make_status_chip(status_row, key)
+            status_sizer.Add(chip, 0, wx.ALIGN_CENTER_VERTICAL)
+            if idx < 3:
+                status_sizer.AddSpacer(8)
+            self._conn_labels[key] = st
+
+        status_row.SetSizer(status_sizer)
+        right_header.Add(status_row, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 12)
+
+        self.little_pill = LittleBuddyPill(
+            header,
+            handler=getattr(
+                self,
+                'on_little_buddy',
+                lambda e: wx.MessageBox(
+                    'Little Buddy handler missing (on_little_buddy).',
+                    'Little Buddy',
+                    wx.OK | wx.ICON_ERROR,
+                ),
+            ),
+        )
+        right_header.Add(self.little_pill, 0, wx.ALIGN_CENTER_VERTICAL)
+        hbox.Add(right_header, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 10)
+
+        header.SetSizer(hbox)
+        main.Add(header, 0, wx.EXPAND)
+
+        # KPI bar
+        kpi_panel = wx.Panel(self)
+        kpi_panel.SetBackgroundColour(BG)
+        krow = wx.BoxSizer(wx.HORIZONTAL)
+        self.card_rows = KPIBadge(kpi_panel, "Rows")
+        self.card_cols = KPIBadge(kpi_panel, "Columns")
+        self.card_nulls = KPIBadge(kpi_panel, "Null %")
+        self.card_unique = KPIBadge(kpi_panel, "Uniqueness")
+        self.card_quality = KPIBadge(kpi_panel, "DQ Score")
+        self.card_validity = KPIBadge(kpi_panel, "Validity")
+        self.card_complete = KPIBadge(kpi_panel, "Completeness")
+        self.card_anoms = KPIBadge(kpi_panel, "Anomalies")
+        for c in (
+            self.card_rows,
+            self.card_cols,
+            self.card_nulls,
+            self.card_unique,
+            self.card_quality,
+            self.card_validity,
+            self.card_complete,
+            self.card_anoms,
+        ):
+            krow.Add(c, 1, wx.ALL | wx.EXPAND, 6)
+        kpi_panel.SetSizer(krow)
+        main.Add(kpi_panel, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 6)
+
+        # Toolbar: fill the row evenly so cards use available width without creating a big empty gap
+        toolbar_panel = wx.Panel(self)
+        toolbar_panel.SetBackgroundColour(BG)
+        tb_outer = wx.BoxSizer(wx.HORIZONTAL)
+
+        tint_data = wx.Colour(252, 250, 255)
         tint_analyze = wx.Colour(250, 250, 255)
         tint_actions = wx.Colour(252, 248, 255)
 
-        # Group 1: Data Sources
-        g_data = _group("DATA SOURCES", 240, tint=tint_data)
+        g_data_panel, g_data = make_section(toolbar_panel, "DATA SOURCES", 170, tint=tint_data)
         add_btn(g_data, "Connect", self.on_upload_menu)
+        tb_outer.Add(g_data_panel, 1, wx.ALL | wx.EXPAND, 6)
 
-        _vsep()
-
-        # Group 2: Analyze
-        g_analyze = _group("ANALYZE", 470, tint=tint_analyze)
+        g_analyze_panel, g_analyze = make_section(toolbar_panel, "ANALYZE", 250, tint=tint_analyze)
         add_btn(g_analyze, "Profile", lambda e: self.do_analysis_process("Profile"))
         add_btn(g_analyze, "Quality", lambda e: self.do_analysis_process("Quality"))
         add_btn(g_analyze, "Catalog", lambda e: self.do_analysis_process("Catalog"))
         add_btn(g_analyze, "Compliance", lambda e: self.do_analysis_process("Compliance"))
         add_btn(g_analyze, "Anomalies", lambda e: self.do_analysis_process("Detect Anomalies"))
+        tb_outer.Add(g_analyze_panel, 2, wx.ALL | wx.EXPAND, 6)
 
-        _vsep()
-
-        # Group 3: Actions
-        g_actions = _group("ACTIONS", 610, tint=tint_actions)
+        g_actions_panel, g_actions = make_section(toolbar_panel, "ACTIONS", 300, tint=tint_actions)
         add_btn(g_actions, "Rule Assignment", self.on_rules)
         add_btn(g_actions, "Transform", self.on_transform_menu)
         add_btn(g_actions, "Undo", self.on_undo)
@@ -484,50 +541,23 @@ class MainWindow(wx.Frame):
         add_btn(g_actions, "Synthetic Data", self.on_generate_synth)
         add_btn(g_actions, "To Do", self.on_run_tasks)
         add_btn(g_actions, "DBT", self.on_dbt_menu)
+        tb_outer.Add(g_actions_panel, 2, wx.ALL | wx.EXPAND, 6)
 
-        _vsep()
-
-        # Group 4: Deploy
-        g_deploy = _group("DEPLOY", 700, tint=tint_actions)
+        g_deploy_panel, g_deploy = make_section(toolbar_panel, "DEPLOY", 320, tint=tint_actions)
         add_btn(g_deploy, "Export", self.on_export_menu)
         add_btn(g_deploy, "AWS Glue Bundle", self.on_generate_config_files)
         add_btn(g_deploy, "Snowflake Bundle", self.on_generate_snowflake_bundle)
         add_btn(g_deploy, "Fabric Bundle", self.on_generate_fabric_bundle)
         add_btn(g_deploy, "Purview Export", self.on_purview_export)
         add_btn(g_deploy, "dbt Bundle", self.on_generate_dbt_bundle)
+        tb_outer.Add(g_deploy_panel, 2, wx.ALL | wx.EXPAND, 6)
 
-        tb_outer.AddStretchSpacer(1)
         toolbar_panel.SetSizer(tb_outer)
-
-        # Fit scroller to content width (single-row feel; scrolls if too narrow)
-        toolbar_panel.Layout()
-        toolbar_scroller.SetVirtualSize(toolbar_panel.GetBestSize())
-        toolbar_scroller.SetSizer(wx.BoxSizer(wx.VERTICAL))
-        toolbar_scroller.GetSizer().Add(toolbar_panel, 0, wx.EXPAND | wx.ALL, 8)
-        toolbar_scroller.FitInside()
-
-        # KPI bar
-        kpi_panel = wx.Panel(self); kpi_panel.SetBackgroundColour(BG)
-        krow = wx.BoxSizer(wx.HORIZONTAL)
-        self.card_rows     = KPIBadge(kpi_panel, "Rows")
-        self.card_cols     = KPIBadge(kpi_panel, "Columns")
-        self.card_nulls    = KPIBadge(kpi_panel, "Null %")
-        self.card_unique   = KPIBadge(kpi_panel, "Uniqueness")
-        self.card_quality  = KPIBadge(kpi_panel, "DQ Score")
-        self.card_validity = KPIBadge(kpi_panel, "Validity")
-        self.card_complete = KPIBadge(kpi_panel, "Completeness")
-        self.card_anoms    = KPIBadge(kpi_panel, "Anomalies")
-        for c in (self.card_rows, self.card_cols, self.card_nulls, self.card_unique,
-                  self.card_quality, self.card_validity, self.card_complete, self.card_anoms):
-            krow.Add(c, 1, wx.ALL | wx.EXPAND, 6)
-        kpi_panel.SetSizer(krow)
-
-        # Order: KPIs first, toolbar second
-        main.Add(kpi_panel, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 6)
-        main.Add(toolbar_scroller, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 6)
+        main.Add(toolbar_panel, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 6)
 
         # Knowledge files strip
-        info_panel = wx.Panel(self); info_panel.SetBackgroundColour(wx.Colour(243, 239, 255))
+        info_panel = wx.Panel(self)
+        info_panel.SetBackgroundColour(wx.Colour(243, 239, 255))
         hz = wx.BoxSizer(wx.HORIZONTAL)
         lab = wx.StaticText(info_panel, label="Knowledge Files:")
         lab.SetForegroundColour(wx.Colour(44,31,72))
@@ -543,7 +573,7 @@ class MainWindow(wx.Frame):
         self.catalog_toolbar_panel = wx.Panel(self)
         self.catalog_toolbar_panel.SetBackgroundColour(wx.Colour(243, 239, 255))
         ct = wx.BoxSizer(wx.HORIZONTAL)
-        self.btn_catalog_save  = RoundedShadowButton(self.catalog_toolbar_panel, "Save Catalog Edits", self.on_catalog_save)
+        self.btn_catalog_save = RoundedShadowButton(self.catalog_toolbar_panel, "Save Catalog Edits", self.on_catalog_save)
         self.btn_catalog_reset = RoundedShadowButton(self.catalog_toolbar_panel, "Reset Catalog Edits", self.on_catalog_reset, colour=wx.Colour(160, 120, 200))
         ct.Add(self.btn_catalog_save, 0, wx.ALL, 6)
         ct.Add(self.btn_catalog_reset, 0, wx.ALL, 6)
@@ -556,17 +586,18 @@ class MainWindow(wx.Frame):
         splitter = wx.SplitterWindow(self, style=wx.SP_LIVE_UPDATE)
         splitter.SetMinimumPaneSize(140)
 
-        # Top pane: data grid
         top_panel = wx.Panel(splitter)
         top_panel.SetBackgroundColour(BG)
-        self.grid = gridlib.Grid(top_panel); self.grid.CreateGrid(0, 0)
+        self.grid = gridlib.Grid(top_panel)
+        self.grid.CreateGrid(0, 0)
         self.grid.SetDefaultCellTextColour(wx.Colour(35, 31, 51))
         self.grid.SetDefaultCellBackgroundColour(wx.Colour(255,255,255))
         self.grid.SetLabelTextColour(wx.Colour(60,60,90))
         self.grid.SetLabelBackgroundColour(wx.Colour(235,231,250))
         self.grid.SetGridLineColour(wx.Colour(220,214,245))
         self.grid.EnableEditing(False)
-        self.grid.SetRowLabelSize(36); self.grid.SetColLabelSize(28)
+        self.grid.SetRowLabelSize(36)
+        self.grid.SetColLabelSize(28)
         self.grid.Bind(wx.EVT_SIZE, self.on_grid_resize)
         self.grid.Bind(gridlib.EVT_GRID_CELL_CHANGED, self.on_cell_changed)
 
@@ -574,10 +605,8 @@ class MainWindow(wx.Frame):
         tp.Add(self.grid, 1, wx.EXPAND | wx.ALL, 8)
         top_panel.SetSizer(tp)
 
-        # Bottom pane: Wizard Console (logs/issues/summary + progress)
         bottom_panel = wx.Panel(splitter)
         bottom_panel.SetBackgroundColour(wx.Colour(252, 250, 255))
-
         bp = wx.BoxSizer(wx.VERTICAL)
 
         console_hdr = wx.BoxSizer(wx.HORIZONTAL)
@@ -592,7 +621,7 @@ class MainWindow(wx.Frame):
 
         self.progress_label = wx.StaticText(bottom_panel, label="")
         self.progress_label.SetForegroundColour(wx.Colour(94, 64, 150))
-        self.lbl_console_status = self.progress_label  # backward-compatible alias
+        self.lbl_console_status = self.progress_label
         console_hdr.Add(self.progress_label, 0, wx.RIGHT | wx.ALIGN_CENTER_VERTICAL, 8)
 
         self.progress_gauge = wx.Gauge(bottom_panel, range=100, size=(220, 12), style=wx.GA_HORIZONTAL)
@@ -604,16 +633,14 @@ class MainWindow(wx.Frame):
 
         nb = wx.Notebook(bottom_panel)
 
-        # Logs tab
         p_logs = wx.Panel(nb)
         v_logs = wx.BoxSizer(wx.VERTICAL)
         self.txt_logs = wx.TextCtrl(p_logs, value="", style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL)
-        self.txt_console = self.txt_logs  # backward-compatible alias
+        self.txt_console = self.txt_logs
         v_logs.Add(self.txt_logs, 1, wx.EXPAND | wx.ALL, 8)
         p_logs.SetSizer(v_logs)
         nb.AddPage(p_logs, "Logs")
 
-        # Issues tab
         p_issues = wx.Panel(nb)
         v_issues = wx.BoxSizer(wx.VERTICAL)
         self.txt_issues = wx.TextCtrl(p_issues, value="No issues yet.", style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL)
@@ -621,7 +648,6 @@ class MainWindow(wx.Frame):
         p_issues.SetSizer(v_issues)
         nb.AddPage(p_issues, "Issues")
 
-        # Summary tab
         p_summary = wx.Panel(nb)
         v_sum = wx.BoxSizer(wx.VERTICAL)
         self.txt_summary = wx.TextCtrl(p_summary, value="Load a dataset to see summary.", style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL)
@@ -637,11 +663,15 @@ class MainWindow(wx.Frame):
 
         # Menubar
         mb = wx.MenuBar()
-        m_file = wx.Menu(); m_file.Append(wx.ID_EXIT, "&Quit\tCtrl+Q"); mb.Append(m_file, "&File")
+        m_file = wx.Menu()
+        m_file.Append(wx.ID_EXIT, "&Quit	Ctrl+Q")
+        mb.Append(m_file, "&File")
         self.Bind(wx.EVT_MENU, lambda e: self.Close(), id=wx.ID_EXIT)
 
-        m_settings = wx.Menu(); OPEN_SETTINGS_ID = wx.NewIdRef()
-        m_settings.Append(OPEN_SETTINGS_ID, "&Preferences...\tCtrl+,"); mb.Append(m_settings, "&Settings")
+        m_settings = wx.Menu()
+        OPEN_SETTINGS_ID = wx.NewIdRef()
+        m_settings.Append(OPEN_SETTINGS_ID, "&Preferences...	Ctrl+,")
+        mb.Append(m_settings, "&Settings")
         self.Bind(wx.EVT_MENU, self.open_settings, id=OPEN_SETTINGS_ID)
         self.SetMenuBar(mb)
 
